@@ -1,0 +1,49 @@
+version: 1
+
+bitwarden:
+  backend: bws
+  project_id: "00000000-0000-0000-0000-000000000000"
+  cache_seconds: 300
+
+paths:
+  leases_db: /var/lib/keyholder/leases.db
+  audit_log: /var/log/keyholder/audit.jsonl
+
+callers:
+  hermes:
+    uid_name: hermes
+    profiles:
+      default:
+        grants:
+          - name: github-readonly
+            provider: github_app
+            ttl_seconds: 600
+            max_ttl_seconds: 900
+            bitwarden_refs:
+              app_id: "github-app-id"
+              private_key_pem: "github-app-private-key-pem"
+            installation_id: 12345678
+            permissions:
+              metadata: read
+              contents: read
+              pull_requests: read
+          - name: aws-s3-logs-read
+            provider: aws_sts
+            ttl_seconds: 900
+            max_ttl_seconds: 1800
+            bitwarden_refs:
+              aws_access_key_id: "aws-source-access-key-id"
+              aws_secret_access_key: "aws-source-secret-access-key"
+            role_arn: "arn:aws:iam::123456789012:role/hermes-s3-logs-read"
+            external_id: "hermes-local"
+            session_tags:
+              app: hermes
+              profile: default
+          - name: openrouter-chat-proxy
+            provider: local_proxy
+            ttl_seconds: 300
+            max_ttl_seconds: 600
+            bitwarden_refs:
+              upstream_api_key: "openrouter-api-key"
+            allowed_routes:
+              - /v1/chat/completions

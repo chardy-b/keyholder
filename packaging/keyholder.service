@@ -1,0 +1,31 @@
+[Unit]
+Description=Local Keyholder Token Broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=keyholder
+Group=keyholder
+RuntimeDirectory=keyholder
+RuntimeDirectoryMode=0750
+StateDirectory=keyholder
+LogsDirectory=keyholder
+
+ExecStart=/usr/local/bin/keyholderd --config /etc/keyholder/policy.yaml --socket /run/keyholder/keyholder.sock --socket-group keyholder-clients
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/keyholder /var/log/keyholder /run/keyholder
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+LoadCredentialEncrypted=bws-access-token:/etc/keyholder/bws-access-token.cred
+Environment=BWS_ACCESS_TOKEN_FILE=%d/bws-access-token
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
