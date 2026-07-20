@@ -13,7 +13,7 @@ class GitHubAppProvider:
 
     def issue(self, grant: dict, secrets: dict[str, str], ttl_seconds: int) -> IssuedCredential:
         now = int(datetime.now(UTC).timestamp())
-        app_id = str(secrets["app_id"])
+        app_id = str(grant["app_id"])
         payload = {"iat": now - 60, "exp": now + min(ttl_seconds, 600), "iss": app_id}
         signed = jwt.encode(payload, secrets["private_key_pem"], algorithm="RS256")
         installation_id = grant["installation_id"]

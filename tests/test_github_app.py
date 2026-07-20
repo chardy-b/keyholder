@@ -14,8 +14,8 @@ def test_github_app_posts_installation_token(monkeypatch):
         calls.append((url, headers, json, timeout)); return Response()
     monkeypatch.setattr("keyholderd.providers.github_app.jwt.encode", lambda payload, key, algorithm: "jwt-token")
     monkeypatch.setattr("keyholderd.providers.github_app.requests.post", fake_post)
-    grant = {"installation_id":123, "permissions":{"metadata":"read", "contents":"read"}}
-    cred = GitHubAppProvider().issue(grant, {"app_id":"42", "private_key_pem":"pem"}, 600)
+    grant = {"app_id":"42", "installation_id":123, "permissions":{"metadata":"read", "contents":"read"}}
+    cred = GitHubAppProvider().issue(grant, {"private_key_pem":"pem"}, 600)
     assert calls[0][0].endswith("/app/installations/123/access_tokens")
     assert calls[0][1]["Authorization"] == "Bearer jwt-token"
     assert calls[0][2]["permissions"] == grant["permissions"]

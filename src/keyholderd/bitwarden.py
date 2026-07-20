@@ -47,8 +47,6 @@ class BwsResolver:
                 LOG.debug("Bitwarden cache hit for configured secret ref %s", secret_ref)
                 return value
         cmd = ["bws", "secret", "get", secret_ref, "--output", "json"]
-        if self.project_id:
-            cmd.extend(["--project-id", self.project_id])
         LOG.debug("Resolving Bitwarden secret ref %s via bws", secret_ref)
         result = self.runner(cmd, capture_output=True, text=True, env=self._env(), timeout=30)
         if result.returncode != 0:
