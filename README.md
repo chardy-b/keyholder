@@ -55,14 +55,48 @@ Adding a new provider means writing a class with a single `issue(grant, secrets,
 
 ## Installation
 
-The install below assumes a single-host deployment. It creates a dedicated `keyholder` system user, installs the daemon into `/opt/keyholder`, and wires up the systemd service.
+Prerequisites: Linux with systemd ≥ 254, Python ≥ 3.11, and `bws` on `PATH` (see [Requirements](#requirements)).
 
-### 1. Encrypt the Bitwarden access token
+```bash
+git clone <this-repo-url> keyholder && cd keyholder
+sudo packaging/install.sh --client-user "$USER"
+keyholder doctor
+```
+
+`install.sh` creates the `keyholder` system user and `keyholder-clients` group, installs the daemon into `/opt/keyholder`, encrypts your Bitwarden access token as a systemd credential (prompts interactively unless `--bws-token-file PATH` is given), installs the example policy (only if none exists), and starts the service. It is idempotent — re-run it any time, including after `git pull` (see [Upgrading](#upgrading)).
+
+`--client-user "$USER"` adds you to `keyholder-clients` so you can reach the socket; group membership only takes effect in **new** shells — run `newgrp keyholder-clients` or log back in, then `keyholder doctor` should report everything `ok`.
+
+Before `keyholder grants` returns anything, edit `/etc/keyholder/policy.yaml` (the installer drops in `packaging/policy.example.yaml` as a starting point) and `sudo systemctl restart keyholder.service`.
+
+Full usage: `sudo packaging/install.sh [--client-user USER] [--bws-token-file PATH] [--no-start]`.
+
+<details>
+<summary>Manual install (what the script does)</summary>
+
+This is the mechanism `install.sh` automates — the reference for the `.deb` postinst, or for doing it by hand.
+
+#### 1. Create users, groups, and directories
+
+```bash
+sudo groupadd --system keyholder
+sudo useradd  --system --home /var/lib/keyholder --shell /usr/sbin/nologin --gid keyholder keyholder
+sudo groupadd --system keyholder-clients
+sudo usermod  -aG keyholder-clients keyholder          # daemon needs this to chgrp the socket
+sudo usermod  -aG keyholder-clients "$USER"            # you (or whoever will call it) need this to reach the socket
+
+sudo install -d -o root      -g keyholder -m 0750 /etc/keyholder
+```
+
+(`/var/lib/keyholder`, `/var/log/keyholder`, and `/run/keyholder` are created by `StateDirectory=`/`LogsDirectory=`/`RuntimeDirectory=` in the service unit — no manual `install -d` needed for those.)
+
+Group changes only take effect in **new** shells. Run `newgrp keyholder-clients` for a group-active subshell or log out and back in.
+
+#### 2. Encrypt the Bitwarden access token
 
 Create a machine account token in the Bitwarden Secrets Manager UI (see [Bitwarden docs](https://bitwarden.com/help/access-tokens/)). Then encrypt it as a systemd credential — the plaintext never touches disk:
 
 ```bash
-sudo install -d -o root -g keyholder -m 0750 /etc/keyholder
 sudo systemd-creds encrypt --name=bws-access-token - /etc/keyholder/bws-access-token.cred
 # paste the token, hit Enter, then Ctrl-D
 sudo chown root:keyholder /etc/keyholder/bws-access-token.cred
@@ -75,23 +109,9 @@ Verify with:
 sudo systemd-creds decrypt --name=bws-access-token /etc/keyholder/bws-access-token.cred - | head -c 20; echo
 ```
 
-### 2. Create users, groups, and directories
+**This file is sealed to the host's key/TPM and cannot be copied between machines** — every host encrypts its own copy (see [Replicating to another machine](#replicating-to-another-machine)).
 
-```bash
-sudo groupadd --system keyholder
-sudo useradd  --system --home /var/lib/keyholder --shell /usr/sbin/nologin --gid keyholder keyholder
-sudo groupadd --system keyholder-clients
-sudo usermod  -aG keyholder-clients keyholder          # daemon needs this to chgrp the socket
-sudo usermod  -aG keyholder-clients "$USER"            # you (or whoever will call it) need this to reach the socket
-
-sudo install -d -o root      -g keyholder -m 0750 /etc/keyholder
-sudo install -d -o keyholder -g keyholder -m 0700 /var/lib/keyholder
-sudo install -d -o keyholder -g adm       -m 0750 /var/log/keyholder
-```
-
-Group changes only take effect in **new** shells. Run `newgrp keyholder-clients` for a group-active subshell or log out and back in.
-
-### 3. Install the daemon
+#### 3. Install the daemon
 
 Build a venv outside `/home` so `ProtectHome=true` in the service unit doesn't hide it:
 
@@ -103,7 +123,7 @@ sudo install -m 0755 /opt/keyholder/venv/bin/keyholder  /usr/local/bin/keyholder
 sudo install -m 0755 /opt/keyholder/venv/bin/keyholderd /usr/local/bin/keyholderd
 ```
 
-### 4. Install the policy and service unit
+#### 4. Install the policy and service unit
 
 ```bash
 sudo install -m 0640 -o root -g keyholder packaging/policy.example.yaml /etc/keyholder/policy.yaml
@@ -120,13 +140,41 @@ sudo ls -la /run/keyholder/
 # srw-rw---- 1 keyholder keyholder-clients … keyholder.sock
 ```
 
-### 5. Confirm the caller can reach it
+#### 5. Confirm the caller can reach it
 
 In a `keyholder-clients`-active shell:
 
 ```bash
 keyholder grants
 ```
+
+</details>
+
+### Upgrading
+
+```bash
+git pull
+sudo packaging/install.sh
+```
+
+This reinstalls the package into the existing venv and restarts the service. It never touches an existing `policy.yaml` or `bws-access-token.cred`. Equivalent by hand: `sudo /opt/keyholder/venv/bin/pip install --force-reinstall --no-deps .` then `sudo systemctl restart keyholder.service`.
+
+### Replicating to another machine
+
+Two artifacts are host-specific and are never copied between machines:
+
+- **`/etc/keyholder/policy.yaml`** — callers are identified by Linux username via `SO_PEERCRED`, so the policy is inherently per-host. Edit a fresh copy of `packaging/policy.example.yaml` for each new host.
+- **`/etc/keyholder/bws-access-token.cred`** — sealed with `systemd-creds` to the host's own key/TPM; a copy from another machine will not decrypt. Run `packaging/install.sh` (or the manual encryption step) on each host to mint its own.
+
+Everything else (the venv, the service unit, the sysusers fragment) is safe to reproduce by re-running `install.sh` on the new host.
+
+### Installing a specific release
+
+```bash
+pip install git+<this-repo-url>@v0.2.0
+```
+
+works from any checkout or tag; there is no PyPI publication yet.
 
 ## Configuration
 
@@ -194,9 +242,15 @@ keyholder run github-readonly --env GITHUB_TOKEN --ttl 300 --reason "list repos"
 
 # Revoke an outstanding lease
 keyholder revoke lease_abc123def --reason "no longer needed"
+
+# Self-diagnose this host: systemd version, bws on PATH, service state, socket
+# perms, group membership, policy/credential presence, and a live grants check
+keyholder doctor
 ```
 
 **Every request requires a `--reason`.** Reasons are recorded in the audit log so you can trace why any given credential was minted.
+
+`keyholder doctor` prints one line per check (`ok` / `warn` / `fail` plus a hint on failure) and exits non-zero if anything failed. It does not require `sudo` — checks that need root (decrypting the `.cred` file) degrade to a `warn` instead of failing. It does not write audit events; the `grants` call it makes at the end is audited as usual.
 
 ## Security model
 
