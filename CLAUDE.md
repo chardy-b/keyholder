@@ -33,7 +33,7 @@ uv pip install -e '.[test]'   # once
 uv run pytest -q              # run tests
 ```
 
-The suite must stay green (`30 passed`) before commits. If you add functionality, add tests for it in the same commit.
+The suite must stay green (`54 passed`) before commits. If you add functionality, add tests for it in the same commit.
 
 ## Deployment notes for this host
 

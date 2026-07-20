@@ -215,7 +215,7 @@ uv pip install -e '.[test]'
 uv run pytest -v
 ```
 
-The full test suite (30 tests) covers policy parsing, lease persistence, audit-log sanitization, peer-credential resolution, each provider's issue logic, the Bitwarden resolver, the HTTP handler, the CLI, and a fake-provider end-to-end round trip.
+The full test suite (54 tests) covers policy parsing, lease persistence, audit-log sanitization, peer-credential resolution, each provider's issue logic, the Bitwarden resolver, the HTTP handler, the CLI (including `keyholder doctor`'s individual checks), and a fake-provider end-to-end round trip.
 
 ## Roadmap
 
