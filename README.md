@@ -284,6 +284,7 @@ Other niceties: `GET /v1/leases` + `keyholder leases` for visibility, `SIGHUP` p
 
 - [`docs/hermes-usage.md`](docs/hermes-usage.md) — rules for AI agent callers (narrowest grant, shortest TTL, prefer `run` over `issue`, never touch Bitwarden or upstream keys directly).
 - [`docs/grafana-logging.md`](docs/grafana-logging.md) — scraping the daemon's structured logs and audit trail into Grafana Loki via Alloy/Promtail.
+- [`CHANGELOG.md`](CHANGELOG.md) — notable changes per release.
 
 ## License
 

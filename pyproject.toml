@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "local-keyholder"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local Unix-socket token broker for Hermes"
 readme = "README.md"
 requires-python = ">=3.11"
