@@ -1,0 +1,53 @@
+# nfpm package definition for keyholder. Build with packaging/build-deb.sh,
+# which stages dependency wheels and sets $KEYHOLDER_VERSION before invoking
+# `nfpm package -f packaging/nfpm.yaml -p deb`.
+name: keyholder
+arch: amd64
+platform: linux
+version: ${KEYHOLDER_VERSION}
+section: admin
+priority: optional
+maintainer: keyholder maintainers <noreply@example.invalid>
+homepage: https://example.invalid/keyholder
+license: TBD
+description: |
+  Local Unix-socket token broker. Authenticates callers by Linux peer
+  credentials, checks a YAML policy, and mints short-lived, narrowly
+  scoped credentials from long-lived secrets held in Bitwarden Secrets
+  Manager. Every issue is audit-logged and every lease is revocable.
+
+depends:
+  - python3 (>= 3.11)
+  - systemd (>= 254)
+
+contents:
+  # Service unit and sysusers fragment go in /usr/lib, the sysadmin-editable
+  # copies (/etc/systemd/system, /etc/sysusers.d) are for install.sh users.
+  - src: ./keyholder.service
+    dst: /usr/lib/systemd/system/keyholder.service
+    file_info:
+      mode: 0644
+
+  - src: ./keyholder.sysusers.conf
+    dst: /usr/lib/sysusers.d/keyholder.conf
+    file_info:
+      mode: 0644
+
+  - src: ./policy.example.yaml
+    dst: /usr/share/keyholder/policy.example.yaml
+    file_info:
+      mode: 0644
+
+  # Wheels for the package and every dependency, staged by build-deb.sh, so
+  # postinst never needs network access. Leave file_info unset: for `type:
+  # tree` nfpm applies a single mode to the destination directory itself, and
+  # 0644 (no execute bit) makes it non-traversable -- the default (0755) is
+  # what we want here.
+  - src: ./staging/wheels
+    dst: /usr/share/keyholder/wheels
+    type: tree
+
+scripts:
+  postinstall: ./deb/postinst
+  preremove: ./deb/prerm
+  postremove: ./deb/postrm

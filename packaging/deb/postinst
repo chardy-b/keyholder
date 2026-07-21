@@ -1,0 +1,65 @@
+#!/bin/sh
+# postinst for keyholder.deb: must never prompt and never overwrite existing
+# config. Mirrors packaging/install.sh's mechanism (see README "Manual
+# install" section) but as a non-interactive package script.
+set -e
+
+VENV=/opt/keyholder/venv
+WHEELS=/usr/share/keyholder/wheels
+CONFIG_DIR=/etc/keyholder
+POLICY="$CONFIG_DIR/policy.yaml"
+
+log() { echo "keyholder postinst: $*"; }
+
+case "$1" in
+  configure)
+    # sysusers.d/keyholder.conf ships in /usr/lib/sysusers.d/ via package
+    # contents; apply it now (dpkg doesn't run systemd-sysusers for us).
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+      systemd-sysusers /usr/lib/sysusers.d/keyholder.conf
+      log "applied sysusers fragment"
+    else
+      log "WARNING: systemd-sysusers not found; create the keyholder user/group manually"
+    fi
+
+    if [ ! -x "$VENV/bin/python3" ]; then
+      python3 -m venv "$VENV"
+      log "created venv at $VENV"
+    fi
+    "$VENV/bin/pip" install --no-index --find-links "$WHEELS" local-keyholder
+    log "installed keyholder into $VENV from bundled wheels (no network used)"
+
+    for bin in keyholder keyholderd; do
+      ln -sf "$VENV/bin/$bin" "/usr/local/bin/$bin"
+    done
+    log "symlinked entry points into /usr/local/bin"
+
+    install -d -o root -g keyholder -m 0750 "$CONFIG_DIR"
+
+    if [ -e "$POLICY" ]; then
+      log "policy already present at $POLICY, leaving alone"
+    else
+      install -m 0640 -o root -g keyholder /usr/share/keyholder/policy.example.yaml "$POLICY"
+      log "installed example policy to $POLICY (edit before use)"
+    fi
+
+    systemctl daemon-reload || true
+    systemctl enable keyholder.service || true
+
+    log ""
+    log "keyholder installed. Two per-host steps remain (a package must not"
+    log "do these for you):"
+    log "  1. Encrypt your Bitwarden access token:"
+    log "       sudo systemd-creds encrypt --name=bws-access-token - $CONFIG_DIR/bws-access-token.cred"
+    log "       sudo chown root:keyholder $CONFIG_DIR/bws-access-token.cred"
+    log "       sudo chmod 0640 $CONFIG_DIR/bws-access-token.cred"
+    log "  2. Add caller users to the keyholder-clients group:"
+    log "       sudo usermod -aG keyholder-clients <user>"
+    log "  Then edit $POLICY and run: sudo systemctl restart keyholder.service"
+    log "  Verify with: keyholder doctor"
+    ;;
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,16 @@
+#!/bin/sh
+# prerm for keyholder.deb: stop/disable the service before removal.
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl stop keyholder.service || true
+      systemctl disable keyholder.service || true
+    fi
+    ;;
+  upgrade|failed-upgrade)
+    ;;
+esac
+
+exit 0

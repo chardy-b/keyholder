@@ -1,0 +1,39 @@
+#!/bin/sh
+# postrm for keyholder.deb.
+#
+# On `apt remove`: uninstall the venv and entry-point symlinks that postinst
+# created by hand (dpkg doesn't track them), but leave /etc/keyholder,
+# /var/lib/keyholder, and /var/log/keyholder in place.
+#
+# On `apt purge`: also remove the policy, lease store, and logs -- but keep
+# bws-access-token.cred. Deleting a sealed credential silently on purge would
+# be hostile; the operator can remove it explicitly if they really want to.
+set -e
+
+log() { echo "keyholder postrm: $*"; }
+
+remove_program_files() {
+  rm -f /usr/local/bin/keyholder /usr/local/bin/keyholderd
+  rm -rf /opt/keyholder/venv
+}
+
+case "$1" in
+  remove)
+    remove_program_files
+    log "left /etc/keyholder, /var/lib/keyholder, /var/log/keyholder in place (purge to remove config/state/logs)"
+    ;;
+  purge)
+    remove_program_files
+    rm -f /etc/keyholder/policy.yaml
+    rm -rf /var/lib/keyholder
+    rm -rf /var/log/keyholder
+    if [ -e /etc/keyholder/bws-access-token.cred ]; then
+      log "NOTE: keeping /etc/keyholder/bws-access-token.cred -- it is sealed to this host and deleting credentials silently on purge would be hostile."
+      log "      Remove it yourself if you really want it gone: sudo rm /etc/keyholder/bws-access-token.cred"
+    fi
+    ;;
+  upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+esac
+
+exit 0
