@@ -9,6 +9,16 @@ paths:
   leases_db: /var/lib/keyholder/leases.db
   audit_log: /var/log/keyholder/audit.jsonl
 
+proxy:
+  enabled: true
+  host: 127.0.0.1
+  port: 8787
+  max_body_bytes: 8388608
+  max_response_bytes: 8388608
+  max_workers: 16
+  request_timeout_seconds: 15
+  upstream_timeout_seconds: 30
+
 callers:
   hermes:
     uid_name: hermes
@@ -43,7 +53,10 @@ callers:
             provider: local_proxy
             ttl_seconds: 300
             max_ttl_seconds: 600
+            upstream_base_url: https://openrouter.ai/api
             bitwarden_refs:
               upstream_api_key: "openrouter-api-key"
+            allowed_methods:
+              - POST
             allowed_routes:
               - /v1/chat/completions
