@@ -13,7 +13,7 @@ from urllib.parse import parse_qs
 import pytest
 import requests
 
-from keyholderd.server import handle_issue, handle_revoke
+from keyholderd.server import ServerError, handle_issue, handle_revoke
 
 
 OAUTH = "oauth-access-sentinel"
@@ -147,6 +147,22 @@ def test_revoke_denies_existing_capability_and_audit_has_metadata_only(tmp_path,
         lifecycle.stop()
 
 
+def test_revoke_only_allows_lease_owner_and_preserves_capability_for_other_callers(tmp_path, https_google_upstream):
+    upstream, cert = https_google_upstream
+    cfg = _config(tmp_path, f"https://localhost:{upstream.server_port}/token")
+    lifecycle = _lifecycle(cfg, upstream_origin=f"https://localhost:{upstream.server_port}", upstream_verify=str(cert), token_resolver=lambda _item: OAUTH)
+    lifecycle.start()
+    try:
+        token, lease_id = lifecycle.issue_for_test("caller-a", "calendar-proxy", 60, with_lease=True)
+        with pytest.raises(ServerError, match="^not authorized$") as exc_info:
+            handle_revoke(cfg, "caller-b", {"lease_id": lease_id, "reason": "nope"})
+        assert exc_info.value.status == 403
+        assert lifecycle.store.lookup(token)["revoked"] is False
+        assert handle_revoke(cfg, "caller-a", {"lease_id": lease_id, "reason": "done"})["revoked"]
+    finally:
+        lifecycle.stop()
+
+
 def test_proxy_rejects_non_loopback_bind_and_shutdown_releases_listener(tmp_path, https_google_upstream):
     upstream, cert = https_google_upstream
     with pytest.raises(ValueError):
@@ -230,3 +246,22 @@ def test_serve_wires_production_lifecycle_and_closes_it_on_shutdown(tmp_path, ht
     assert not thread.is_alive() and lifecycle.server is None
     with pytest.raises((ConnectionError, requests.RequestException)):
         requests.get(f"http://{lifecycle.host}:{lifecycle.port}/", timeout=1)
+
+
+def test_serve_stops_proxy_when_unix_server_startup_fails(tmp_path, https_google_upstream, monkeypatch):
+    upstream, cert = https_google_upstream
+    cfg = _config(tmp_path, f"https://localhost:{upstream.server_port}/token")
+    cfg["google_calendar_proxy"] = {"enabled": True, "bind": "127.0.0.1", "port": 0}
+    config_path = tmp_path / "policy.yaml"
+    config_path.write_text(json.dumps(cfg))
+    from keyholderd import server
+    made = []
+    def factory(config, proxy_cfg):
+        lifecycle = _lifecycle(config, bind=proxy_cfg["bind"], port=proxy_cfg["port"], upstream_origin=f"https://localhost:{upstream.server_port}", upstream_verify=str(cert), token_resolver=lambda _item: OAUTH)
+        made.append(lifecycle)
+        return lifecycle
+    monkeypatch.setattr(server, "_create_proxy_lifecycle", factory)
+    monkeypatch.setattr(server, "UnixHTTPServer", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("forced unix server failure")))
+    with pytest.raises(OSError, match="forced unix server failure"):
+        server.serve(str(config_path), str(tmp_path / "keyholder.sock"))
+    assert made and made[0].server is None

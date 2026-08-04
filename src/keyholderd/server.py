@@ -128,6 +128,8 @@ def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) 
     lease_db, audit = _audit_paths(config)
     leases = LeaseStore(lease_db)
     lease = leases.get_lease(request["lease_id"])
+    if lease.caller_user != caller:
+        raise ServerError("not authorized", 403)
     leases.revoke(request["lease_id"])
     _proxy_store(config).revoke_lease(request["lease_id"])
     write_audit_event(audit, {"event":"revoke", "caller":caller, "profile":lease.profile, "grant":lease.grant_name, "provider":lease.provider, "template":TEMPLATE if lease.provider == "google_calendar_proxy" else "", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
@@ -194,18 +196,18 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None, *
     config = load_policy(config_path)
     proxy_cfg = config.get("google_calendar_proxy", {})
     proxy_server = None
-    if proxy_cfg.get("enabled", False):
-        bind = proxy_cfg.get("bind", "127.0.0.1")
-        if bind not in {"127.0.0.1", "::1", "localhost"}:
-            raise PolicyError("google_calendar_proxy bind must be loopback")
-        port = proxy_cfg.get("port", 0)
-        if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
-            raise PolicyError("google_calendar_proxy port must be an integer from 0 through 65535")
-
-        proxy_lifecycle = _create_proxy_lifecycle(config, proxy_cfg)
-        proxy_lifecycle.start()
-        proxy_server = proxy_lifecycle
     try:
+        if proxy_cfg.get("enabled", False):
+            bind = proxy_cfg.get("bind", "127.0.0.1")
+            if bind not in {"127.0.0.1", "::1", "localhost"}:
+                raise PolicyError("google_calendar_proxy bind must be loopback")
+            port = proxy_cfg.get("port", 0)
+            if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+                raise PolicyError("google_calendar_proxy port must be an integer from 0 through 65535")
+
+            proxy_lifecycle = _create_proxy_lifecycle(config, proxy_cfg)
+            proxy_server = proxy_lifecycle
+            proxy_lifecycle.start()
         with UnixHTTPServer(socket_path, config) as server:
             if socket_group:
                 gid = grp.getgrnam(socket_group).gr_gid
