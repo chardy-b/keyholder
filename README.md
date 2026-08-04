@@ -41,7 +41,8 @@ Deployable and tested end-to-end today for GitHub App tokens (read and write). A
 | ------------- | ------------------------------------------------------- | ----------------------------- |
 | `github_app`  | GitHub App installation access tokens (via JWT)         | Tested end-to-end             |
 | `aws_sts`     | AWS session credentials (`AKIA…` + session token)       | Implemented, awaiting smoke test |
-| `local_proxy` | Opaque capability tokens (`khcap_…`) for a future proxy | Issues tokens; consumer pending |
+| `local_proxy` | Opaque capability tokens (`khcap_…`) for a future proxy | Issues tokens; consumer pending (not a deployed generic proxy) |
+| `google_calendar_proxy` | Revocable named-template read capability for Google Calendar events | Loopback-only HTTPS proxy; fixed route/origin |
 | `google_oauth` | Google OAuth 2.0 access token via refresh-token exchange | Implemented; use `keyholder run` |
 | `fake`        | Deterministic fake credential for tests                 | Test-only                     |
 

@@ -22,10 +22,12 @@ from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
 from .providers.google_oauth import GoogleOAuthProvider
 from .providers.local_proxy import LocalProxyProvider
+from .proxy import CapabilityStore, CalendarProxy, TEMPLATE
 
 LOG = logging.getLogger(__name__)
 
 PROVIDERS = {"fake": FakeProvider(), "github_app": GitHubAppProvider(), "aws_sts": AwsStsProvider(), "google_oauth": GoogleOAuthProvider(), "local_proxy": LocalProxyProvider()}
+PROXY_CAPABILITIES = CapabilityStore()
 
 
 class ServerError(RuntimeError):
@@ -78,6 +80,19 @@ def _issue_credential(config: dict[str, Any], caller: str, profile: str, grant_n
 
 
 def handle_issue(config: dict[str, Any], caller: str, request: dict[str, Any]) -> dict[str, Any]:
+    grant = get_grant(config, caller, request.get("profile", "default"), request["grant"])
+    if grant.get("provider") == "google_calendar_proxy":
+        ttl = validate_ttl(grant, request.get("ttl_seconds"))
+        google = GoogleOAuthProvider()
+        google.validate(grant)
+        google.validate_secret_refs(grant.get("bitwarden_refs"))
+        secrets = _resolver(config).resolve_refs(grant["bitwarden_refs"])
+        google.issue(grant, secrets, ttl)
+        token, expires = PROXY_CAPABILITIES.issue(caller, request["grant"], ttl)
+        lease_db, audit = _audit_paths(config)
+        lease = LeaseStore(lease_db).create_lease(caller, request.get("profile", "default"), request["grant"], "google_calendar_proxy", ttl, request.get("reason", ""))
+        write_audit_event(audit, {"event":"issue", "caller":caller, "profile":request.get("profile", "default"), "grant":request["grant"], "provider":"google_calendar_proxy", "template":TEMPLATE, "ttl_seconds":ttl, "lease_id":lease.lease_id, "reason":request.get("reason", "")})
+        return {"token_type":"capability", "capability":token, "expires_at":expires.isoformat(), "lease_id":lease.lease_id, "provider":"google_calendar_proxy", "template":TEMPLATE}
     cred, lease, _ttl = _issue_credential(config, caller, request.get("profile", "default"), request["grant"], request.get("ttl_seconds"), request.get("reason", ""))
     return {"token_type":cred.token_type, "access_token":cred.display_token, "expires_at":cred.expires_at.isoformat(), "lease_id":lease.lease_id, "provider":cred.provider, "scope_summary":cred.scope_summary}
 

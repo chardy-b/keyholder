@@ -47,6 +47,16 @@ callers:
               upstream_api_key: "openrouter-api-key"
             allowed_routes:
               - /v1/chat/completions
+          - name: google-calendar-events-read-proxy
+            provider: google_calendar_proxy
+            ttl_seconds: 300
+            max_ttl_seconds: 600
+            token_endpoint: https://oauth2.googleapis.com/token
+            template: google-calendar-events-read
+            bitwarden_refs:
+              client_id: "google-workspace-cli-client-id"
+              client_secret: "google-workspace-cli-client-secret"
+              refresh_token: "google-calendar-read-refresh-token"
           - name: google-calendar-read
             provider: google_oauth
             ttl_seconds: 300
