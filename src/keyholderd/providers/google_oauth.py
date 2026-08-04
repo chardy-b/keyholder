@@ -11,16 +11,25 @@ from .base import IssuedCredential
 
 class GoogleOAuthProvider:
     name = "google_oauth"
+
+    def __init__(self, session_factory=None):
+        # Injectable only to make transport behavior testable; production uses
+        # requests.Session with normal certificate verification unchanged.
+        self._session_factory = session_factory
     timeout_seconds = 15
     clock_skew_seconds = 60
+    # Google controls the token's direct validity. Keyholder only subtracts a
+    # clock-skew safety margin and refuses tokens with less than one minute
+    # remaining afterward, so callers do not receive an immediately expiring
+    # credential.
     min_expires_in = 60
-    min_usable_lifetime_seconds = 1
+    min_usable_lifetime_seconds = 60
     max_expires_in = 86_400
 
     def issue(self, grant: dict, secrets: dict[str, str], ttl_seconds: int) -> IssuedCredential:
         endpoint = grant.get("token_endpoint", "https://oauth2.googleapis.com/token")
         self.validate(grant)
-        session = requests.Session()
+        session = (self._session_factory or requests.Session)()
         session.trust_env = False
         try:
             response = session.post(

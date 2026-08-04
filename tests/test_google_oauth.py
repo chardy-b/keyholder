@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import http.server
+import json
 import ssl
 import subprocess
 import threading
@@ -101,8 +102,8 @@ def test_provider_registered_and_invalid_endpoint_fails_before_secret_resolution
     assert not called
 
 
-@pytest.mark.parametrize("expires_in,accepted", [(60, False), (61, True)])
-def test_adjusted_lifetime_has_strictly_usable_boundary(monkeypatch, expires_in, accepted):
+@pytest.mark.parametrize("expires_in,accepted", [(119, False), (120, True)])
+def test_adjusted_lifetime_has_meaningful_usable_boundary(monkeypatch, expires_in, accepted):
     session = FakeSession()
     session.response = FakeResponse(payload={"access_token": "x", "token_type": "Bearer", "expires_in": expires_in})
     monkeypatch.setattr("keyholderd.providers.google_oauth.requests.Session", lambda: session)
@@ -134,55 +135,70 @@ def test_malformed_endpoint_fails_closed(endpoint):
         GoogleOAuthProvider.validate(grant(token_endpoint=endpoint))
 
 
-def test_real_https_session_exchange_and_form_parameters(tmp_path):
-    cert = tmp_path / "cert.pem"
-    key = tmp_path / "key.pem"
+def test_public_issue_path_uses_verified_https_and_audits_without_secrets(monkeypatch, tmp_path):
+    cert = tmp_path / "localhost-ca.pem"
+    key = tmp_path / "localhost-key.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key), "-out", str(cert), "-days", "1", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"], check=True, capture_output=True)
     received = {}
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             from urllib.parse import parse_qs
             received.update(parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode()))
-            body = b'{"access_token":"https-access","token_type":"Bearer","expires_in":3600}'
-            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-        def log_message(self, *_args): pass
-    server = http.server.ThreadingHTTPServer(("localhost", 0), Handler)
+            body = b'{"access_token":"access-sentinel","token_type":"Bearer","expires_in":3600}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    upstream = http.server.ThreadingHTTPServer(("localhost", 0), Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=str(cert), keyfile=str(key))
-    server.socket = context.wrap_socket(server.socket, server_side=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
-    try:
-        provider = GoogleOAuthProvider()
-        original = provider
-        import keyholderd.providers.google_oauth as module
-        real_session = module.requests.Session
-        def session():
-            s = real_session(); s.verify = str(cert); return s
-        module.requests.Session = session
-        try:
-            cred = original.issue(grant(token_endpoint=f"https://localhost:{server.server_port}/token"), secrets(), 900)
-        finally:
-            module.requests.Session = real_session
-        assert received == {"client_id": ["client-sentinel"], "client_secret": ["secret-sentinel"], "refresh_token": ["refresh-sentinel"], "grant_type": ["refresh_token"]}
-        assert cred.display_token == "https-access"
-    finally:
-        server.shutdown(); server.server_close(); thread.join(timeout=5)
+    upstream.socket = context.wrap_socket(upstream.socket, server_side=True)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
 
-
-def test_server_google_issue_audit_contains_no_secret_sentinels(monkeypatch, tmp_path):
     refs = {"client_id": "client-ref", "client_secret": "secret-ref", "refresh_token": "refresh-ref"}
     values = {"client_id": "client-sentinel", "client_secret": "secret-sentinel", "refresh_token": "refresh-sentinel"}
+
     class Resolver:
         def resolve_refs(self, actual):
             assert actual == refs
             return values
-    class Session(FakeSession):
-        def __init__(self):
-            super().__init__(); self.response = FakeResponse(payload={"access_token": "access-sentinel", "token_type": "Bearer", "expires_in": 3600})
+
+    def verified_session():
+        session = requests.Session()
+        session.verify = str(cert)
+        return session
+
+    import requests
+    from keyholderd.server import handle_issue
+    provider = GoogleOAuthProvider(session_factory=verified_session)
     monkeypatch.setattr("keyholderd.server._resolver", lambda _config: Resolver())
-    monkeypatch.setattr("keyholderd.providers.google_oauth.requests.Session", Session)
-    cfg = {"paths": {"leases_db": str(tmp_path / "leases.db"), "audit_log": str(tmp_path / "audit.jsonl")}, "callers": {"hermes": {"uid_name": "hermes", "profiles": {"default": {"grants": [grant(provider="google_oauth", bitwarden_refs=refs)]}}}}}
-    _issue_credential(cfg, "hermes", "default", "calendar-read", None, "test")
-    text = (tmp_path / "audit.jsonl").read_text()
-    for sentinel in (*values.values(), "access-sentinel"):
-        assert sentinel not in text
+    monkeypatch.setitem(PROVIDERS, "google_oauth", provider)
+    cfg = {"version": 1, "paths": {"leases_db": str(tmp_path / "leases.db"), "audit_log": str(tmp_path / "audit.jsonl")}, "callers": {"hermes": {"uid_name": "hermes", "profiles": {"default": {"grants": [grant(token_endpoint=f"https://localhost:{upstream.server_port}/token", provider="google_oauth", bitwarden_refs=refs, ttl_seconds=300, max_ttl_seconds=600)]}}}}}
+    try:
+        result = handle_issue(cfg, "hermes", {"grant": "calendar-read", "ttl_seconds": 300, "reason": "integration test"})
+        assert result["provider"] == "google_oauth"
+        assert result["token_type"] == "Bearer"
+        assert result["access_token"] == "access-sentinel"
+        assert result["lease_id"]
+        assert result["scope_summary"] == "Google OAuth refresh-token grant"
+        assert received == {"client_id": ["client-sentinel"], "client_secret": ["secret-sentinel"], "refresh_token": ["refresh-sentinel"], "grant_type": ["refresh_token"]}
+        audit = (tmp_path / "audit.jsonl").read_text()
+        events = [json.loads(line) for line in audit.splitlines()]
+        issuance = next(event for event in events if event["event"] == "issue")
+        assert issuance["provider"] == "google_oauth"
+        assert issuance["grant"] == "calendar-read"
+        assert issuance["lease_id"] == result["lease_id"]
+        assert issuance["scope_summary"] == "Google OAuth refresh-token grant"
+        for sentinel in (*values.values(), "access-sentinel"):
+            assert sentinel not in audit
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=5)
