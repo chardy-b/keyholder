@@ -16,7 +16,7 @@ class Session:
 
 def test_named_template_forwards_only_safe_google_request():
     store=CapabilityStore(); token, _=store.issue("hermes", "google-calendar-events-read-proxy", 30); session=Session()
-    proxy=CalendarProxy(store, lambda: "oauth-access", session_factory=lambda: session)
+    proxy=CalendarProxy(store, lambda _item: "oauth-access", session_factory=lambda: session)
     status, headers, body=proxy.forward(token,"hermes","google-calendar-events-read-proxy","GET","/calendar/v3/calendars/primary/events",{"maxResults":["5"]},{"Authorization":"attacker","X-Forwarded-For":"x"})
     assert status == 200 and body == b'{"ok":true}'
     assert session.calls[0][0].endswith("?maxResults=5")

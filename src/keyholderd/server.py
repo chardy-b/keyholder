@@ -9,6 +9,7 @@ import socketserver
 import subprocess
 import grp
 import threading
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -83,6 +84,10 @@ def _issue_credential(config: dict[str, Any], caller: str, profile: str, grant_n
 def handle_issue(config: dict[str, Any], caller: str, request: dict[str, Any]) -> dict[str, Any]:
     grant = get_grant(config, caller, request.get("profile", "default"), request["grant"])
     if grant.get("provider") == "google_calendar_proxy":
+        if grant.get("template") != TEMPLATE:
+            raise PolicyError("google_calendar_proxy grant must use the Google Calendar proxy template")
+        if not request.get("reason"):
+            raise ServerError("reason is required", 400)
         ttl = validate_ttl(grant, request.get("ttl_seconds"))
         google = GoogleOAuthProvider()
         google.validate(grant)
@@ -114,9 +119,11 @@ def handle_run(config: dict[str, Any], caller: str, request: dict[str, Any]) -> 
 
 def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) -> dict[str, Any]:
     lease_db, audit = _audit_paths(config)
-    LeaseStore(lease_db).revoke(request["lease_id"])
+    leases = LeaseStore(lease_db)
+    lease = leases.get_lease(request["lease_id"])
+    leases.revoke(request["lease_id"])
     PROXY_CAPABILITIES.revoke_lease(request["lease_id"])
-    write_audit_event(audit, {"event":"revoke", "caller":caller, "grant":"", "provider":"", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
+    write_audit_event(audit, {"event":"revoke", "caller":caller, "profile":lease.profile, "grant":lease.grant_name, "provider":lease.provider, "template":TEMPLATE if lease.provider == "google_calendar_proxy" else "", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
     return {"revoked": True, "lease_id": request["lease_id"]}
 
 
@@ -177,20 +184,32 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None) -
         bind = proxy_cfg.get("bind", "127.0.0.1")
         if bind not in {"127.0.0.1", "::1", "localhost"}:
             raise PolicyError("google_calendar_proxy bind must be loopback")
-        def resolve(item):
+        port = proxy_cfg.get("port", 0)
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+            raise PolicyError("google_calendar_proxy port must be an integer from 0 through 65535")
+
+        def resolve(item: dict[str, Any]) -> str:
             grant = get_grant(config, item["caller"], item.get("profile", "default"), item["grant"])
+            if grant.get("provider") != "google_calendar_proxy" or grant.get("template") != TEMPLATE:
+                raise PolicyError("proxy capability grant must use the Google Calendar proxy template")
             secrets = _resolver(config).resolve_refs(grant["bitwarden_refs"])
-            return GoogleOAuthProvider().issue(grant, secrets, 300).display_token
+            remaining = max(1, int((item["expires"] - datetime.now(UTC)).total_seconds()))
+            return GoogleOAuthProvider().issue(grant, secrets, remaining).display_token
         proxy = CalendarProxy(PROXY_CAPABILITIES, resolve)
-        proxy_server = ProxyHTTPServer((bind, int(proxy_cfg.get("port", 0))), proxy)
+        proxy_server = ProxyHTTPServer((bind, port), proxy)
         threading.Thread(target=proxy_server.serve_forever, daemon=True, name="google-calendar-proxy").start()
-    with UnixHTTPServer(socket_path, config) as server:
-        if socket_group:
-            gid = grp.getgrnam(socket_group).gr_gid
-            os.chown(socket_path, -1, gid)
-        os.chmod(socket_path, 0o660)
-        LOG.info("keyholderd listening on %s", socket_path)
-        server.serve_forever()
+    try:
+        with UnixHTTPServer(socket_path, config) as server:
+            if socket_group:
+                gid = grp.getgrnam(socket_group).gr_gid
+                os.chown(socket_path, -1, gid)
+            os.chmod(socket_path, 0o660)
+            LOG.info("keyholderd listening on %s", socket_path)
+            server.serve_forever()
+    finally:
+        if proxy_server is not None:
+            proxy_server.shutdown()
+            proxy_server.server_close()
 
 
 def main(argv: list[str] | None = None) -> int:
