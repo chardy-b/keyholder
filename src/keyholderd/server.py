@@ -66,6 +66,7 @@ def _issue_credential(config: dict[str, Any], caller: str, profile: str, grant_n
     if isinstance(provider, GoogleOAuthProvider):
         try:
             provider.validate(grant)
+            provider.validate_secret_refs(grant.get("bitwarden_refs"))
         except ValueError as exc:
             raise ServerError(str(exc), 400) from exc
     secrets = _resolver(config).resolve_refs(grant.get("bitwarden_refs", {}))

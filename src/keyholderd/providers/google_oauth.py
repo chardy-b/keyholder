@@ -14,6 +14,7 @@ class GoogleOAuthProvider:
     timeout_seconds = 15
     clock_skew_seconds = 60
     min_expires_in = 60
+    min_usable_lifetime_seconds = 1
     max_expires_in = 86_400
 
     def issue(self, grant: dict, secrets: dict[str, str], ttl_seconds: int) -> IssuedCredential:
@@ -49,12 +50,34 @@ class GoogleOAuthProvider:
             raise ValueError("Google OAuth expires_in must be finite numeric")
         if not self.min_expires_in <= expires_in <= self.max_expires_in:
             raise ValueError("Google OAuth expires_in is outside safe bounds")
-        expires_at = datetime.now(UTC) + timedelta(seconds=max(0, expires_in - self.clock_skew_seconds))
+        adjusted_lifetime = expires_in - self.clock_skew_seconds
+        if adjusted_lifetime < self.min_usable_lifetime_seconds:
+            raise ValueError("Google OAuth expires_in leaves no usable credential lifetime")
+        expires_at = datetime.now(UTC) + timedelta(seconds=adjusted_lifetime)
         return IssuedCredential(self.name, "Bearer", {"GOOGLE_WORKSPACE_CLI_TOKEN": token}, token, expires_at, "Google OAuth refresh-token grant")
 
     @classmethod
     def validate(cls, grant: dict) -> None:
+        if not isinstance(grant, dict):
+            raise ValueError("google_oauth grant must be an object")
         endpoint = grant.get("token_endpoint", "https://oauth2.googleapis.com/token")
-        parsed = urlparse(endpoint)
-        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        if not isinstance(endpoint, str) or not endpoint:
             raise ValueError("google_oauth token_endpoint must be a strict HTTPS URL")
+        try:
+            parsed = urlparse(endpoint)
+        except ValueError as exc:
+            raise ValueError("google_oauth token_endpoint must be a strict HTTPS URL") from exc
+        try:
+            hostname = parsed.hostname
+        except ValueError as exc:
+            raise ValueError("google_oauth token_endpoint must be a strict HTTPS URL") from exc
+        if parsed.scheme != "https" or not hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("google_oauth token_endpoint must be a strict HTTPS URL")
+
+    @classmethod
+    def validate_secret_refs(cls, refs: object) -> None:
+        if not isinstance(refs, dict):
+            raise ValueError("google_oauth bitwarden_refs must be an object")
+        required = ("client_id", "client_secret", "refresh_token")
+        if any(not isinstance(refs.get(name), str) or not refs[name].strip() for name in required):
+            raise ValueError("google_oauth bitwarden_refs must contain nonempty client_id, client_secret, and refresh_token strings")
