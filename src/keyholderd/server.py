@@ -183,7 +183,14 @@ class KeyholderHandler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(exc)})
 
 
-def serve(config_path: str, socket_path: str, socket_group: str | None = None) -> None:
+def _create_proxy_lifecycle(config: dict[str, Any], proxy_cfg: dict[str, Any]):
+    """Create the production proxy; test code may replace this private seam."""
+    from .proxy import ProxyLifecycle
+    return ProxyLifecycle(config, bind=proxy_cfg.get("bind", "127.0.0.1"), port=proxy_cfg.get("port", 0))
+
+
+def serve(config_path: str, socket_path: str, socket_group: str | None = None, *,
+          _ready: threading.Event | None = None, _stop: threading.Event | None = None) -> None:
     config = load_policy(config_path)
     proxy_cfg = config.get("google_calendar_proxy", {})
     proxy_server = None
@@ -195,16 +202,9 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None) -
         if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
             raise PolicyError("google_calendar_proxy port must be an integer from 0 through 65535")
 
-        def resolve(item: dict[str, Any]) -> str:
-            grant = get_grant(config, item["caller"], item.get("profile", "default"), item["grant"])
-            if grant.get("provider") != "google_calendar_proxy" or grant.get("template") != TEMPLATE:
-                raise PolicyError("proxy capability grant must use the Google Calendar proxy template")
-            secrets = _resolver(config).resolve_refs(grant["bitwarden_refs"])
-            remaining = max(1, int((item["expires"] - datetime.now(UTC)).total_seconds()))
-            return GoogleOAuthProvider().issue(grant, secrets, remaining).display_token
-        proxy = CalendarProxy(PROXY_CAPABILITIES, resolve)
-        proxy_server = ProxyHTTPServer((bind, port), proxy)
-        threading.Thread(target=proxy_server.serve_forever, daemon=True, name="google-calendar-proxy").start()
+        proxy_lifecycle = _create_proxy_lifecycle(config, proxy_cfg)
+        proxy_lifecycle.start()
+        proxy_server = proxy_lifecycle
     try:
         with UnixHTTPServer(socket_path, config) as server:
             if socket_group:
@@ -212,11 +212,16 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None) -
                 os.chown(socket_path, -1, gid)
             os.chmod(socket_path, 0o660)
             LOG.info("keyholderd listening on %s", socket_path)
-            server.serve_forever()
+            if _ready:
+                _ready.set()
+            if _stop:
+                while not _stop.wait(0.05):
+                    pass
+            else:
+                server.serve_forever()
     finally:
         if proxy_server is not None:
-            proxy_server.shutdown()
-            proxy_server.server_close()
+            proxy_server.stop()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -5,6 +5,7 @@ import os
 import ssl
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -179,3 +180,53 @@ def test_handle_revoke_waits_for_inflight_forward_before_returning(tmp_path, htt
         assert denied.status_code == 403 and len(_GoogleHandler.requests_seen) == 1
     finally:
         lifecycle.stop()
+
+
+
+def test_real_listener_denies_expired_capability_without_resolver_or_upstream(tmp_path, https_google_upstream):
+    upstream, cert = https_google_upstream
+    resolver_calls = []
+    cfg = _config(tmp_path, f"https://localhost:{upstream.server_port}/token")
+    lifecycle = _lifecycle(cfg, upstream_origin=f"https://localhost:{upstream.server_port}", upstream_verify=str(cert), token_resolver=lambda item: resolver_calls.append(item) or OAUTH)
+    lifecycle.start()
+    try:
+        token = lifecycle.issue_for_test("hermes", "calendar-proxy", 1)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and lifecycle.store.lookup(token)["expires"].timestamp() > time.time():
+            time.sleep(0.01)
+        assert lifecycle.store.lookup(token)["expires"].timestamp() <= time.time()
+        response = requests.get(f"http://{lifecycle.host}:{lifecycle.port}/calendar/v3/calendars/primary/events", headers={"Authorization": f"Bearer {token}"}, timeout=5)
+        assert response.status_code == 403 and resolver_calls == [] and _GoogleHandler.requests_seen == []
+    finally:
+        lifecycle.stop()
+
+
+def test_serve_wires_production_lifecycle_and_closes_it_on_shutdown(tmp_path, https_google_upstream, monkeypatch):
+    upstream, cert = https_google_upstream
+    cfg = _config(tmp_path, f"https://localhost:{upstream.server_port}/token")
+    cfg["google_calendar_proxy"] = {"enabled": True, "bind": "127.0.0.1", "port": 0}
+    config_path = tmp_path / "policy.yaml"
+    config_path.write_text(json.dumps(cfg))
+    from keyholderd import server
+    monkeypatch.setattr(server, "_resolver", lambda _cfg: type("R", (), {"resolve_refs": lambda self, refs: {"client_id": "client-sentinel", "client_secret": "secret-sentinel", "refresh_token": "refresh-sentinel"}})())
+    made = []
+    def factory(config, proxy_cfg):
+        lifecycle = _lifecycle(config, bind=proxy_cfg["bind"], port=proxy_cfg["port"], upstream_origin=f"https://localhost:{upstream.server_port}", upstream_verify=str(cert), token_resolver=lambda _item: OAUTH)
+        made.append(lifecycle)
+        return lifecycle
+    monkeypatch.setattr(server, "_create_proxy_lifecycle", factory)
+    ready, stop = threading.Event(), threading.Event()
+    thread = threading.Thread(target=server.serve, args=(str(config_path), str(tmp_path / "keyholder.sock")), kwargs={"_ready": ready, "_stop": stop}, daemon=True)
+    thread.start(); assert ready.wait(5) and made
+    lifecycle = made[0]
+    try:
+        issued = handle_issue(cfg, "hermes", {"grant": "calendar-proxy", "ttl_seconds": 60, "reason": "serve integration"})
+        response = requests.get(f"http://{lifecycle.host}:{lifecycle.port}/calendar/v3/calendars/primary/events", headers={"Authorization": f"Bearer {issued['capability']}"}, timeout=5)
+        assert response.status_code == 200
+        assert handle_revoke(cfg, "hermes", {"lease_id": issued["lease_id"], "reason": "done"})["revoked"]
+        assert requests.get(f"http://{lifecycle.host}:{lifecycle.port}/calendar/v3/calendars/primary/events", headers={"Authorization": f"Bearer {issued['capability']}"}, timeout=5).status_code == 403
+    finally:
+        stop.set(); thread.join(5)
+    assert not thread.is_alive() and lifecycle.server is None
+    with pytest.raises((ConnectionError, requests.RequestException)):
+        requests.get(f"http://{lifecycle.host}:{lifecycle.port}/", timeout=1)
