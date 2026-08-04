@@ -8,6 +8,7 @@ import socket
 import socketserver
 import subprocess
 import grp
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -22,7 +23,7 @@ from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
 from .providers.google_oauth import GoogleOAuthProvider
 from .providers.local_proxy import LocalProxyProvider
-from .proxy import CapabilityStore, CalendarProxy, TEMPLATE
+from .proxy import CapabilityStore, CalendarProxy, ProxyHTTPServer, TEMPLATE
 
 LOG = logging.getLogger(__name__)
 
@@ -86,11 +87,9 @@ def handle_issue(config: dict[str, Any], caller: str, request: dict[str, Any]) -
         google = GoogleOAuthProvider()
         google.validate(grant)
         google.validate_secret_refs(grant.get("bitwarden_refs"))
-        secrets = _resolver(config).resolve_refs(grant["bitwarden_refs"])
-        google.issue(grant, secrets, ttl)
-        token, expires = PROXY_CAPABILITIES.issue(caller, request["grant"], ttl)
         lease_db, audit = _audit_paths(config)
         lease = LeaseStore(lease_db).create_lease(caller, request.get("profile", "default"), request["grant"], "google_calendar_proxy", ttl, request.get("reason", ""))
+        token, expires = PROXY_CAPABILITIES.issue(caller, request["grant"], ttl, lease.lease_id, grant.get("template", TEMPLATE), "GET", request.get("profile", "default"))
         write_audit_event(audit, {"event":"issue", "caller":caller, "profile":request.get("profile", "default"), "grant":request["grant"], "provider":"google_calendar_proxy", "template":TEMPLATE, "ttl_seconds":ttl, "lease_id":lease.lease_id, "reason":request.get("reason", "")})
         return {"token_type":"capability", "capability":token, "expires_at":expires.isoformat(), "lease_id":lease.lease_id, "provider":"google_calendar_proxy", "template":TEMPLATE}
     cred, lease, _ttl = _issue_credential(config, caller, request.get("profile", "default"), request["grant"], request.get("ttl_seconds"), request.get("reason", ""))
@@ -116,6 +115,7 @@ def handle_run(config: dict[str, Any], caller: str, request: dict[str, Any]) -> 
 def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) -> dict[str, Any]:
     lease_db, audit = _audit_paths(config)
     LeaseStore(lease_db).revoke(request["lease_id"])
+    PROXY_CAPABILITIES.revoke_lease(request["lease_id"])
     write_audit_event(audit, {"event":"revoke", "caller":caller, "grant":"", "provider":"", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
     return {"revoked": True, "lease_id": request["lease_id"]}
 
@@ -171,6 +171,19 @@ class KeyholderHandler(BaseHTTPRequestHandler):
 
 def serve(config_path: str, socket_path: str, socket_group: str | None = None) -> None:
     config = load_policy(config_path)
+    proxy_cfg = config.get("google_calendar_proxy", {})
+    proxy_server = None
+    if proxy_cfg.get("enabled", False):
+        bind = proxy_cfg.get("bind", "127.0.0.1")
+        if bind not in {"127.0.0.1", "::1", "localhost"}:
+            raise PolicyError("google_calendar_proxy bind must be loopback")
+        def resolve(item):
+            grant = get_grant(config, item["caller"], item.get("profile", "default"), item["grant"])
+            secrets = _resolver(config).resolve_refs(grant["bitwarden_refs"])
+            return GoogleOAuthProvider().issue(grant, secrets, 300).display_token
+        proxy = CalendarProxy(PROXY_CAPABILITIES, resolve)
+        proxy_server = ProxyHTTPServer((bind, int(proxy_cfg.get("port", 0))), proxy)
+        threading.Thread(target=proxy_server.serve_forever, daemon=True, name="google-calendar-proxy").start()
     with UnixHTTPServer(socket_path, config) as server:
         if socket_group:
             gid = grp.getgrnam(socket_group).gr_gid

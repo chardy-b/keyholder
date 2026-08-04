@@ -9,6 +9,12 @@ paths:
   leases_db: /var/lib/keyholder/leases.db
   audit_log: /var/log/keyholder/audit.jsonl
 
+google_calendar_proxy:
+  # Omit or set enabled: false to keep the listener disabled.
+  enabled: false
+  bind: 127.0.0.1
+  port: 8765
+
 callers:
   hermes:
     uid_name: hermes
