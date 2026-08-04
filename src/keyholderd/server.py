@@ -8,6 +8,8 @@ import socket
 import socketserver
 import subprocess
 import grp
+import threading
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -22,10 +24,19 @@ from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
 from .providers.google_oauth import GoogleOAuthProvider
 from .providers.local_proxy import LocalProxyProvider
+from .proxy import CapabilityStore, CalendarProxy, ProxyHTTPServer, TEMPLATE
 
 LOG = logging.getLogger(__name__)
 
 PROVIDERS = {"fake": FakeProvider(), "github_app": GitHubAppProvider(), "aws_sts": AwsStsProvider(), "google_oauth": GoogleOAuthProvider(), "local_proxy": LocalProxyProvider()}
+PROXY_CAPABILITIES = CapabilityStore()
+_PROXY_STORES: dict[str, CapabilityStore] = {}
+
+def register_proxy_store(config: dict[str, Any], store: CapabilityStore) -> None:
+    _PROXY_STORES[_audit_paths(config)[0]] = store
+
+def _proxy_store(config: dict[str, Any]) -> CapabilityStore:
+    return _PROXY_STORES.get(_audit_paths(config)[0], PROXY_CAPABILITIES)
 
 
 class ServerError(RuntimeError):
@@ -78,6 +89,21 @@ def _issue_credential(config: dict[str, Any], caller: str, profile: str, grant_n
 
 
 def handle_issue(config: dict[str, Any], caller: str, request: dict[str, Any]) -> dict[str, Any]:
+    grant = get_grant(config, caller, request.get("profile", "default"), request["grant"])
+    if grant.get("provider") == "google_calendar_proxy":
+        if grant.get("template") != TEMPLATE:
+            raise PolicyError("google_calendar_proxy grant must use the Google Calendar proxy template")
+        if not request.get("reason"):
+            raise ServerError("reason is required", 400)
+        ttl = validate_ttl(grant, request.get("ttl_seconds"))
+        google = GoogleOAuthProvider()
+        google.validate(grant)
+        google.validate_secret_refs(grant.get("bitwarden_refs"))
+        lease_db, audit = _audit_paths(config)
+        lease = LeaseStore(lease_db).create_lease(caller, request.get("profile", "default"), request["grant"], "google_calendar_proxy", ttl, request.get("reason", ""))
+        token, expires = _proxy_store(config).issue(caller, request["grant"], ttl, lease.lease_id, grant.get("template", TEMPLATE), "GET", request.get("profile", "default"))
+        write_audit_event(audit, {"event":"issue", "caller":caller, "profile":request.get("profile", "default"), "grant":request["grant"], "provider":"google_calendar_proxy", "template":TEMPLATE, "ttl_seconds":ttl, "lease_id":lease.lease_id, "reason":request.get("reason", "")})
+        return {"token_type":"capability", "capability":token, "expires_at":expires.isoformat(), "lease_id":lease.lease_id, "provider":"google_calendar_proxy", "template":TEMPLATE}
     cred, lease, _ttl = _issue_credential(config, caller, request.get("profile", "default"), request["grant"], request.get("ttl_seconds"), request.get("reason", ""))
     return {"token_type":cred.token_type, "access_token":cred.display_token, "expires_at":cred.expires_at.isoformat(), "lease_id":lease.lease_id, "provider":cred.provider, "scope_summary":cred.scope_summary}
 
@@ -100,8 +126,12 @@ def handle_run(config: dict[str, Any], caller: str, request: dict[str, Any]) -> 
 
 def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) -> dict[str, Any]:
     lease_db, audit = _audit_paths(config)
-    LeaseStore(lease_db).revoke(request["lease_id"])
-    write_audit_event(audit, {"event":"revoke", "caller":caller, "grant":"", "provider":"", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
+    leases = LeaseStore(lease_db)
+    lease = leases.get_lease(request["lease_id"])
+    if lease.caller_user != caller:
+        raise ServerError("not authorized", 403)
+    _proxy_store(config).revoke_lease_atomically(request["lease_id"], lambda: leases.revoke(request["lease_id"]))
+    write_audit_event(audit, {"event":"revoke", "caller":caller, "profile":lease.profile, "grant":lease.grant_name, "provider":lease.provider, "template":TEMPLATE if lease.provider == "google_calendar_proxy" else "", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
     return {"revoked": True, "lease_id": request["lease_id"]}
 
 
@@ -154,15 +184,45 @@ class KeyholderHandler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(exc)})
 
 
-def serve(config_path: str, socket_path: str, socket_group: str | None = None) -> None:
+def _create_proxy_lifecycle(config: dict[str, Any], proxy_cfg: dict[str, Any]):
+    """Create the production proxy; test code may replace this private seam."""
+    from .proxy import ProxyLifecycle
+    return ProxyLifecycle(config, bind=proxy_cfg.get("bind", "127.0.0.1"), port=proxy_cfg.get("port", 0))
+
+
+def serve(config_path: str, socket_path: str, socket_group: str | None = None, *,
+          _ready: threading.Event | None = None, _stop: threading.Event | None = None) -> None:
     config = load_policy(config_path)
-    with UnixHTTPServer(socket_path, config) as server:
-        if socket_group:
-            gid = grp.getgrnam(socket_group).gr_gid
-            os.chown(socket_path, -1, gid)
-        os.chmod(socket_path, 0o660)
-        LOG.info("keyholderd listening on %s", socket_path)
-        server.serve_forever()
+    proxy_cfg = config.get("google_calendar_proxy", {})
+    proxy_server = None
+    try:
+        if proxy_cfg.get("enabled", False):
+            bind = proxy_cfg.get("bind", "127.0.0.1")
+            if bind not in {"127.0.0.1", "::1", "localhost"}:
+                raise PolicyError("google_calendar_proxy bind must be loopback")
+            port = proxy_cfg.get("port", 0)
+            if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+                raise PolicyError("google_calendar_proxy port must be an integer from 0 through 65535")
+
+            proxy_lifecycle = _create_proxy_lifecycle(config, proxy_cfg)
+            proxy_server = proxy_lifecycle
+            proxy_lifecycle.start()
+        with UnixHTTPServer(socket_path, config) as server:
+            if socket_group:
+                gid = grp.getgrnam(socket_group).gr_gid
+                os.chown(socket_path, -1, gid)
+            os.chmod(socket_path, 0o660)
+            LOG.info("keyholderd listening on %s", socket_path)
+            if _ready:
+                _ready.set()
+            if _stop:
+                while not _stop.wait(0.05):
+                    pass
+            else:
+                server.serve_forever()
+    finally:
+        if proxy_server is not None:
+            proxy_server.stop()
 
 
 def main(argv: list[str] | None = None) -> int:
