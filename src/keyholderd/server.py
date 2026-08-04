@@ -30,6 +30,13 @@ LOG = logging.getLogger(__name__)
 
 PROVIDERS = {"fake": FakeProvider(), "github_app": GitHubAppProvider(), "aws_sts": AwsStsProvider(), "google_oauth": GoogleOAuthProvider(), "local_proxy": LocalProxyProvider()}
 PROXY_CAPABILITIES = CapabilityStore()
+_PROXY_STORES: dict[str, CapabilityStore] = {}
+
+def register_proxy_store(config: dict[str, Any], store: CapabilityStore) -> None:
+    _PROXY_STORES[_audit_paths(config)[0]] = store
+
+def _proxy_store(config: dict[str, Any]) -> CapabilityStore:
+    return _PROXY_STORES.get(_audit_paths(config)[0], PROXY_CAPABILITIES)
 
 
 class ServerError(RuntimeError):
@@ -94,7 +101,7 @@ def handle_issue(config: dict[str, Any], caller: str, request: dict[str, Any]) -
         google.validate_secret_refs(grant.get("bitwarden_refs"))
         lease_db, audit = _audit_paths(config)
         lease = LeaseStore(lease_db).create_lease(caller, request.get("profile", "default"), request["grant"], "google_calendar_proxy", ttl, request.get("reason", ""))
-        token, expires = PROXY_CAPABILITIES.issue(caller, request["grant"], ttl, lease.lease_id, grant.get("template", TEMPLATE), "GET", request.get("profile", "default"))
+        token, expires = _proxy_store(config).issue(caller, request["grant"], ttl, lease.lease_id, grant.get("template", TEMPLATE), "GET", request.get("profile", "default"))
         write_audit_event(audit, {"event":"issue", "caller":caller, "profile":request.get("profile", "default"), "grant":request["grant"], "provider":"google_calendar_proxy", "template":TEMPLATE, "ttl_seconds":ttl, "lease_id":lease.lease_id, "reason":request.get("reason", "")})
         return {"token_type":"capability", "capability":token, "expires_at":expires.isoformat(), "lease_id":lease.lease_id, "provider":"google_calendar_proxy", "template":TEMPLATE}
     cred, lease, _ttl = _issue_credential(config, caller, request.get("profile", "default"), request["grant"], request.get("ttl_seconds"), request.get("reason", ""))
@@ -122,7 +129,7 @@ def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) 
     leases = LeaseStore(lease_db)
     lease = leases.get_lease(request["lease_id"])
     leases.revoke(request["lease_id"])
-    PROXY_CAPABILITIES.revoke_lease(request["lease_id"])
+    _proxy_store(config).revoke_lease(request["lease_id"])
     write_audit_event(audit, {"event":"revoke", "caller":caller, "profile":lease.profile, "grant":lease.grant_name, "provider":lease.provider, "template":TEMPLATE if lease.provider == "google_calendar_proxy" else "", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
     return {"revoked": True, "lease_id": request["lease_id"]}
 

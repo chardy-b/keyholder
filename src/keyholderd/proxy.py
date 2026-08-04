@@ -108,6 +108,71 @@ class ProxyHTTPServer(ThreadingHTTPServer):
         super().__init__(address, ProxyHandler)
 
 
+class ProxyLifecycle:
+    """Own a proxy listener and the capability store used by daemon handlers."""
+
+    def __init__(self, config: dict[str, Any], *, bind: str = "127.0.0.1", port: int = 0,
+                 upstream_origin: str = GOOGLE_ORIGIN, upstream_verify: bool | str = True,
+                 token_resolver: Callable[[dict[str, Any]], str] | None = None) -> None:
+        if bind not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValueError("proxy must bind loopback")
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+            raise ValueError("proxy port must be an integer from 0 through 65535")
+        self.config = config
+        self.host, self.requested_port = bind, port
+        self.port = port
+        self.store = CapabilityStore()
+        self._test_injection = upstream_origin != GOOGLE_ORIGIN or upstream_verify is not True or token_resolver is not None
+        if not self._test_injection and upstream_origin != GOOGLE_ORIGIN:
+            raise ValueError("production origin is fixed")
+        self._token_resolver = token_resolver or self._production_resolver
+        self.proxy = CalendarProxy(self.store, self._token_resolver, upstream_origin,
+                                    verify=upstream_verify, test_only=self._test_injection)
+        self.server: ProxyHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        from . import server as daemon_server
+        daemon_server.register_proxy_store(config, self.store)
+
+    def _production_resolver(self, item: dict[str, Any]) -> str:
+        from . import server as daemon_server
+        grant = daemon_server.get_grant(self.config, item["caller"], item.get("profile", "default"), item["grant"])
+        if grant.get("provider") != "google_calendar_proxy" or grant.get("template") != TEMPLATE:
+            raise CapabilityError("invalid proxy grant")
+        secrets_map = daemon_server._resolver(self.config).resolve_refs(grant["bitwarden_refs"])
+        remaining = max(1, int((item["expires"] - datetime.now(UTC)).total_seconds()))
+        def oauth_session():
+            session = requests.Session()
+            session.verify = self.proxy.verify
+            return session
+        return daemon_server.GoogleOAuthProvider(session_factory=oauth_session).issue(grant, secrets_map, remaining).display_token
+
+    def start(self) -> None:
+        if self.server is not None:
+            return
+        self.server = ProxyHTTPServer((self.host, self.requested_port), self.proxy)
+        self.port = self.server.server_address[1]
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self.server is None:
+            return
+        self.server.shutdown()
+        self.server.server_close()
+        if self._thread:
+            self._thread.join(timeout=5)
+        self.server = None
+
+    def issue_for_test(self, caller: str, grant: str, ttl: int, *, with_lease: bool = False):
+        from . import server as daemon_server
+        lease = daemon_server.LeaseStore(daemon_server._audit_paths(self.config)[0]).create_lease(caller, "default", grant, "google_calendar_proxy", ttl, "test")
+        token, _ = self.store.issue(caller, grant, ttl, lease.lease_id)
+        audit_path = daemon_server._audit_paths(self.config)[1]
+        from .audit import write_audit_event
+        write_audit_event(audit_path, {"event": "issue", "caller": caller, "profile": "default", "grant": grant, "provider": "google_calendar_proxy", "template": TEMPLATE, "ttl_seconds": ttl, "lease_id": lease.lease_id, "reason": "test"})
+        return (token, lease.lease_id) if with_lease else token
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     server: ProxyHTTPServer
 
