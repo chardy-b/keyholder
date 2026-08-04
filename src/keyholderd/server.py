@@ -130,8 +130,7 @@ def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) 
     lease = leases.get_lease(request["lease_id"])
     if lease.caller_user != caller:
         raise ServerError("not authorized", 403)
-    leases.revoke(request["lease_id"])
-    _proxy_store(config).revoke_lease(request["lease_id"])
+    _proxy_store(config).revoke_lease_atomically(request["lease_id"], lambda: leases.revoke(request["lease_id"]))
     write_audit_event(audit, {"event":"revoke", "caller":caller, "profile":lease.profile, "grant":lease.grant_name, "provider":lease.provider, "template":TEMPLATE if lease.provider == "google_calendar_proxy" else "", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
     return {"revoked": True, "lease_id": request["lease_id"]}
 

@@ -44,7 +44,16 @@ class CapabilityStore:
             if item:
                 item["revoked"] = True
 
+    def revoke_lease_atomically(self, lease_id: str, persist_callback: Callable[[], None]) -> None:
+        """Persist revocation and invalidate capabilities under one lock."""
+        with self._lock:
+            persist_callback()
+            for item in self._items.values():
+                if item["lease_id"] == lease_id:
+                    item["revoked"] = True
+
     def revoke_lease(self, lease_id: str) -> None:
+        """Invalidate capabilities without a backing lease store (test/local use)."""
         with self._lock:
             for item in self._items.values():
                 if item["lease_id"] == lease_id:

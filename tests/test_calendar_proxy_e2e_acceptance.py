@@ -198,6 +198,55 @@ def test_handle_revoke_waits_for_inflight_forward_before_returning(tmp_path, htt
         lifecycle.stop()
 
 
+def test_handle_revoke_atomically_blocks_forward_during_persistence(tmp_path, https_google_upstream, monkeypatch):
+    upstream, cert = https_google_upstream
+    cfg = _config(tmp_path, f"https://localhost:{upstream.server_port}/token")
+    persisted = threading.Event(); release_persistence = threading.Event(); resolver_calls = []
+
+    def resolver(_item):
+        resolver_calls.append(True)
+        return OAUTH
+
+    lifecycle = _lifecycle(cfg, upstream_origin=f"https://localhost:{upstream.server_port}", upstream_verify=str(cert), token_resolver=resolver)
+    lifecycle.start()
+    try:
+        token, lease_id = lifecycle.issue_for_test("hermes", "calendar-proxy", 60, with_lease=True)
+        from keyholderd import server
+        real_lease_store = server.LeaseStore
+
+        def paused_store(path):
+            leases = real_lease_store(path)
+            original_revoke = leases.revoke
+
+            def paused_revoke(lease_id):
+                original_revoke(lease_id)
+                persisted.set()
+                assert release_persistence.wait(5)
+
+            leases.revoke = paused_revoke
+            return leases
+
+        monkeypatch.setattr(server, "LeaseStore", paused_store)
+        revoke_result = []
+        revoke = threading.Thread(target=lambda: revoke_result.append(handle_revoke(cfg, "hermes", {"lease_id": lease_id, "reason": "atomic-race-test"})))
+        revoke.start(); assert persisted.wait(5)
+
+        forward_result = []
+        forward = threading.Thread(target=lambda: forward_result.append(requests.get(
+            f"http://{lifecycle.host}:{lifecycle.port}/calendar/v3/calendars/primary/events",
+            headers={"Authorization": f"Bearer {token}"}, timeout=5)))
+        forward.start()
+        assert not forward_result and resolver_calls == []
+
+        release_persistence.set()
+        revoke.join(5); forward.join(5)
+        assert not revoke.is_alive() and not forward.is_alive()
+        assert revoke_result == [{"revoked": True, "lease_id": lease_id}]
+        assert forward_result[0].status_code == 403 and resolver_calls == []
+    finally:
+        lifecycle.stop()
+
+
 
 def test_real_listener_denies_expired_capability_without_resolver_or_upstream(tmp_path, https_google_upstream):
     upstream, cert = https_google_upstream
