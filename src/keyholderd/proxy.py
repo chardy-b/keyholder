@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -52,21 +53,30 @@ class CapabilityStore:
     def lookup(self, token: str) -> dict[str, Any]:
         with self._lock:
             item = self._items.get(hashlib.sha256(token.encode()).hexdigest())
-        if item is None:
-            raise CapabilityError("invalid capability")
-        return item
+            if item is None:
+                raise CapabilityError("invalid capability")
+            return item.copy()
+
+    @contextmanager
+    def authorize(self, token: str, caller: str, grant: str, method: str, path: str, template: str = TEMPLATE):
+        """Hold the capability lock through the complete protected forward."""
+        with self._lock:
+            if not token:
+                raise CapabilityError("capability required")
+            item = self._items.get(hashlib.sha256(token.encode()).hexdigest())
+            if item is None:
+                raise CapabilityError("invalid capability")
+            if item["revoked"] or item["expires"] <= datetime.now(UTC):
+                raise CapabilityError("invalid capability")
+            if (item["caller"], item["grant"], item["method"], item["template"]) != (caller, grant, method, template):
+                raise CapabilityError("capability metadata mismatch")
+            if method != "GET" or path != ROUTE:
+                raise CapabilityError("route or method not allowed")
+            yield item.copy()
 
     def validate(self, token: str, caller: str, grant: str, method: str, path: str, template: str = TEMPLATE) -> dict[str, Any]:
-        if not token:
-            raise CapabilityError("capability required")
-        item = self.lookup(token)
-        if item["revoked"] or item["expires"] <= datetime.now(UTC):
-            raise CapabilityError("invalid capability")
-        if (item["caller"], item["grant"], item["method"], item["template"]) != (caller, grant, method, template):
-            raise CapabilityError("capability metadata mismatch")
-        if method != "GET" or path != ROUTE:
-            raise CapabilityError("route or method not allowed")
-        return item
+        with self.authorize(token, caller, grant, method, path, template) as item:
+            return item
 
 
 class CalendarProxy:
@@ -80,22 +90,22 @@ class CalendarProxy:
         self.verify = verify
 
     def forward(self, token: str, caller: str, grant: str, method: str, path: str, query: dict[str, list[str]], headers: dict[str, str], body: bytes = b"") -> tuple[int, dict[str, str], bytes]:
-        item = self.store.validate(token, caller, grant, method, path)
-        if len(body) > MAX_REQUEST or any(key not in ALLOWED_QUERY or len(values) != 1 or not values[0] for key, values in query.items()):
-            raise CapabilityError("request not allowed")
-        params = [(key, values[0]) for key, values in query.items()]
-        session = self.session_factory()
-        session.trust_env = False
-        try:
-            access_token = self.token_resolver(item)
-            response = session.get(self.upstream_origin + path + (("?" + urlencode(params)) if params else ""), headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}, timeout=(3, 10), stream=True, verify=self.verify)
-            data = response.raw.read(MAX_RESPONSE + 1)
-            if len(data) > MAX_RESPONSE:
-                raise CapabilityError("response too large")
-            allowed = {key: response.headers[key] for key in ("Content-Type", "ETag", "Cache-Control") if key in response.headers}
-            return response.status_code, allowed, data
-        finally:
-            session.close()
+        with self.store.authorize(token, caller, grant, method, path) as item:
+            if len(body) > MAX_REQUEST or any(key not in ALLOWED_QUERY or len(values) != 1 or not values[0] for key, values in query.items()):
+                raise CapabilityError("request not allowed")
+            params = [(key, values[0]) for key, values in query.items()]
+            session = self.session_factory()
+            session.trust_env = False
+            try:
+                access_token = self.token_resolver(item)
+                response = session.get(self.upstream_origin + path + (("?" + urlencode(params)) if params else ""), headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}, timeout=(3, 10), stream=True, verify=self.verify)
+                data = response.raw.read(MAX_RESPONSE + 1)
+                if len(data) > MAX_RESPONSE:
+                    raise CapabilityError("response too large")
+                allowed = {key: response.headers[key] for key in ("Content-Type", "ETag", "Cache-Control") if key in response.headers}
+                return response.status_code, allowed, data
+            finally:
+                session.close()
 
 
 class ProxyHTTPServer(ThreadingHTTPServer):

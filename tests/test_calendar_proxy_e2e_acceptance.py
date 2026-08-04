@@ -154,3 +154,28 @@ def test_proxy_rejects_non_loopback_bind_and_shutdown_releases_listener(tmp_path
     lifecycle.start(); port = lifecycle.port; lifecycle.stop()
     with pytest.raises((ConnectionError, requests.RequestException)):
         requests.get(f"http://127.0.0.1:{port}/", timeout=1)
+
+
+def test_handle_revoke_waits_for_inflight_forward_before_returning(tmp_path, https_google_upstream):
+    upstream, cert = https_google_upstream
+    cfg = _config(tmp_path, f"https://localhost:{upstream.server_port}/token")
+    entered = threading.Event(); release = threading.Event()
+
+    def resolver(_item):
+        entered.set(); assert release.wait(5); return OAUTH
+
+    lifecycle = _lifecycle(cfg, upstream_origin=f"https://localhost:{upstream.server_port}", upstream_verify=str(cert), token_resolver=resolver)
+    lifecycle.start()
+    try:
+        token, lease_id = lifecycle.issue_for_test("hermes", "calendar-proxy", 60, with_lease=True)
+        forward = threading.Thread(target=lambda: requests.get(f"http://{lifecycle.host}:{lifecycle.port}/calendar/v3/calendars/primary/events", headers={"Authorization": f"Bearer {token}"}, timeout=5))
+        forward.start(); assert entered.wait(5)
+        result: list[dict] = []
+        revoke = threading.Thread(target=lambda: result.append(handle_revoke(cfg, "hermes", {"lease_id": lease_id, "reason": "race-test"})))
+        revoke.start(); assert revoke.is_alive()
+        release.set(); forward.join(5); revoke.join(5)
+        assert not forward.is_alive() and not revoke.is_alive() and result == [{"revoked": True, "lease_id": lease_id}]
+        denied = requests.get(f"http://{lifecycle.host}:{lifecycle.port}/calendar/v3/calendars/primary/events", headers={"Authorization": f"Bearer {token}"}, timeout=5)
+        assert denied.status_code == 403 and len(_GoogleHandler.requests_seen) == 1
+    finally:
+        lifecycle.stop()
