@@ -49,4 +49,3 @@ The listener is off for backward compatibility unless the operator sets
 `proxy.enabled: true` in the daemon policy.
 Capabilities are daemon-memory state and fail closed on restart; issue a new
 capability if the daemon restarts even if its old lease row remains in SQLite.
-
