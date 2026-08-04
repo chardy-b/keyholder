@@ -42,9 +42,13 @@ Deployable and tested end-to-end today for GitHub App tokens (read and write). A
 | `github_app`  | GitHub App installation access tokens (via JWT)         | Tested end-to-end             |
 | `aws_sts`     | AWS session credentials (`AKIA…` + session token)       | Implemented, awaiting smoke test |
 | `local_proxy` | Opaque capability tokens (`khcap_…`) for a future proxy | Issues tokens; consumer pending |
+| `google_oauth` | Google OAuth 2.0 access token via refresh-token exchange | Implemented; use `keyholder run` |
+ 
 | `fake`        | Deterministic fake credential for tests                 | Test-only                     |
 
 Adding a new provider means writing a class with a single `issue(grant, secrets, ttl) -> IssuedCredential` method — see [`src/keyholderd/providers/base.py`](src/keyholderd/providers/base.py).
+
+`google_oauth` uses the strict-HTTPS `token_endpoint` (default `https://oauth2.googleapis.com/token`) and Bitwarden-resolved `client_id`, `client_secret`, and `refresh_token` values. Configure scopes when the refresh token is consented; grant labels do not narrow a broader OAuth grant. Google token validity is controlled by Google's `expires_in`; Keyholder's lease TTL governs broker access and does not limit the token's direct validity.
 
 ## Requirements
 
@@ -238,7 +242,11 @@ keyholder issue github-readonly --ttl 300 --reason "inspect repo metadata"
 
 # Run a command with the token injected as an env var; token never touches your shell
 keyholder run github-readonly --env GITHUB_TOKEN --ttl 300 --reason "list repos" -- \
-    sh -c 'curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/installation/repositories'
+    sh -c 'curl -sf -H "Authorization: Bearer ***" https://api.github.com/installation/repositories'
+
+# Google Workspace CLI: use a purpose-named, narrow grant and never `issue` in Hermes
+keyholder run google-calendar-read --env GOOGLE_WORKSPACE_CLI_TOKEN --ttl 300 --reason "read calendar" -- \
+    gws calendar events list --calendarId primary
 
 # Revoke an outstanding lease
 keyholder revoke lease_abc123def --reason "no longer needed"
