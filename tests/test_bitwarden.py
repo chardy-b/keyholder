@@ -102,6 +102,34 @@ def test_invalid_reference_mapping_rejected_before_runner(refs):
     with pytest.raises(BitwardenError):
         BwsResolver(runner=runner).resolve_refs(refs)
 
+@pytest.mark.parametrize("payload", [
+    {"value": 42, "secret": "valid-secret"},
+    {"value": "", "secret": "valid-secret"},
+    {"secret": 42},
+    {"data": "not-a-mapping"},
+    {"data": {"value": ""}},
+    {"data": {"value": 42}},
+    {},
+])
+def test_present_malformed_secret_fields_reject_without_fallback(payload, caplog):
+    marker = "marker-secret-value"
+
+    def runner(cmd, **kwargs):
+        return type("R", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": marker})()
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(BitwardenError) as exc:
+        BwsResolver(runner=runner).resolve_refs({"token": "123e4567-e89b-12d3-a456-426614174000"})
+    assert marker not in str(exc.value)
+    assert marker not in caplog.text
+
+
+def test_data_value_is_used_when_valid():
+    def runner(cmd, **kwargs):
+        return type("R", (), {"returncode": 0, "stdout": json.dumps({"data": {"value": "valid-secret"}}), "stderr": ""})()
+
+    assert BwsResolver(runner=runner).resolve_refs({"token": "123e4567-e89b-12d3-a456-426614174000"}) == {"token": "valid-secret"}
+
+
 @pytest.mark.parametrize("ref", ["key:", "key:   "])
 def test_blank_key_reference_rejected_before_runner(ref):
     def runner(*args, **kwargs):

@@ -107,13 +107,24 @@ class BwsResolver:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise BitwardenError("bws returned invalid JSON for secret response") from exc
-        if not isinstance(payload, dict):
+        if not isinstance(payload, Mapping):
             raise BitwardenError("bws returned an invalid secret response")
-        data = payload.get("data", {})
-        if not isinstance(data, dict):
-            raise BitwardenError("bws returned an invalid secret response")
-        value = payload.get("value") or payload.get("secret") or data.get("value")
-        if not isinstance(value, str) or not value:
+        if "value" in payload:
+            value = payload["value"]
+            if not isinstance(value, str) or not value:
+                raise BitwardenError("bws response contained an invalid secret value")
+        elif "secret" in payload:
+            value = payload["secret"]
+            if not isinstance(value, str) or not value:
+                raise BitwardenError("bws response contained an invalid secret value")
+        elif "data" in payload:
+            data = payload["data"]
+            if not isinstance(data, Mapping) or "value" not in data:
+                raise BitwardenError("bws response contained an invalid secret value")
+            value = data["value"]
+            if not isinstance(value, str) or not value:
+                raise BitwardenError("bws response contained an invalid secret value")
+        else:
             raise BitwardenError("bws response did not include a secret value")
         if self.cache_seconds > 0:
             self._cache[secret_ref] = (now + self.cache_seconds, value)
