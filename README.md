@@ -8,7 +8,7 @@ Every issue is logged, every credential expires quickly, and any credential can 
 
 ## Status
 
-Deployable and tested end-to-end today for GitHub App tokens (read and write). AWS STS is implemented and ready for a smoke test against a real role. The `local_proxy` provider — for wrapping static third-party API keys behind capability tokens — is stubbed but not yet consumable; the forwarding HTTP listener is the next major piece of work (see [Roadmap](#roadmap)).
+Deployable and tested end-to-end today for GitHub App tokens (read and write). AWS STS is implemented and ready for a smoke test against a real role. The `local_proxy` provider now exposes a loopback-only HTTP listener that validates short-lived capabilities, enforces method and route allowlists, and injects static third-party API keys only on the upstream request. Buffered HTTP request/response forwarding is implemented; transparent streaming remains a roadmap item.
 
 ## How it works
 
@@ -34,6 +34,7 @@ Deployable and tested end-to-end today for GitHub App tokens (read and write). A
 3. The username is looked up in `policy.yaml` to determine which **grants** the caller may request.
 4. When the caller asks to `issue` (or `run`) a grant, the daemon resolves any long-lived material via the Bitwarden Secrets Manager CLI (`bws`), asks the appropriate **provider** to mint a short-lived credential, records a **lease** in SQLite, appends an **audit event**, and returns the credential.
 5. Callers who prefer never to see the token can use `keyholder run <grant> --env VAR -- <cmd>` — the daemon spawns the child with `VAR` set in its environment, so the token exists only in that subprocess's memory.
+6. For `local_proxy` grants, the caller receives only a `khcap_…` capability. Requests sent to the loopback proxy with that capability are method- and route-checked, then forwarded with the real upstream bearer credential substituted inside the daemon.
 
 ## Providers
 
@@ -41,7 +42,7 @@ Deployable and tested end-to-end today for GitHub App tokens (read and write). A
 | ------------- | ------------------------------------------------------- | ----------------------------- |
 | `github_app`  | GitHub App installation access tokens (via JWT)         | Tested end-to-end             |
 | `aws_sts`     | AWS session credentials (`AKIA…` + session token)       | Implemented, awaiting smoke test |
-| `local_proxy` | Opaque capability tokens (`khcap_…`) for a future proxy | Issues tokens; consumer pending |
+| `local_proxy` | Opaque capabilities for route-bound HTTP forwarding    | Buffered forwarding operational |
 | `fake`        | Deterministic fake credential for tests                 | Test-only                     |
 
 Adding a new provider means writing a class with a single `issue(grant, secrets, ttl) -> IssuedCredential` method — see [`src/keyholderd/providers/base.py`](src/keyholderd/providers/base.py).
@@ -192,6 +193,16 @@ paths:
   leases_db: /var/lib/keyholder/leases.db
   audit_log: /var/log/keyholder/audit.jsonl
 
+proxy:
+  enabled: true
+  host: 127.0.0.1
+  port: 8787
+  max_body_bytes: 8388608
+  max_response_bytes: 8388608
+  max_workers: 16
+  request_timeout_seconds: 15
+  upstream_timeout_seconds: 30
+
 callers:
   hermes:
     uid_name: hermes             # Linux username identified via SO_PEERCRED
@@ -219,6 +230,16 @@ callers:
             bitwarden_refs:
               aws_access_key_id:     "<bws-secret-uuid>"
               aws_secret_access_key: "<bws-secret-uuid>"
+
+          - name: openrouter-chat-proxy
+            provider: local_proxy
+            ttl_seconds: 300
+            max_ttl_seconds: 600
+            upstream_base_url: https://openrouter.ai/api
+            bitwarden_refs:
+              upstream_api_key: "<bws-secret-uuid>"
+            allowed_methods: [POST]
+            allowed_routes: [/v1/chat/completions]
 ```
 
 See [`packaging/policy.example.yaml`](packaging/policy.example.yaml) for a fuller starter policy.
@@ -243,6 +264,11 @@ keyholder run github-readonly --env GITHUB_TOKEN --ttl 300 --reason "list repos"
 # Revoke an outstanding lease
 keyholder revoke lease_abc123def --reason "no longer needed"
 
+# local_proxy: mint a harmless short-lived capability, then use it as the
+# bearer token against the loopback listener instead of the real upstream key
+keyholder issue openrouter-chat-proxy --ttl 300 --reason "OpenRouter chat request"
+# API base: http://127.0.0.1:8787
+
 # Self-diagnose this host: systemd version, bws on PATH, service state, socket
 # perms, group membership, policy/credential presence, and a live grants check
 keyholder doctor
@@ -259,6 +285,7 @@ keyholder doctor
 - **Least privilege at every layer.** Grants are per-caller, per-profile, with a hard `max_ttl_seconds` cap and per-provider scope constraints (GitHub App permissions, AWS role ARNs, allowed proxy routes).
 - **Short-lived by default.** Tokens are minted with an expiry; leases are recorded so any credential can be revoked immediately without rotating the upstream key.
 - **Audit-first.** Every `grants`, `issue`, `run`, and `revoke` request writes a JSONL record to `/var/log/keyholder/audit.jsonl`. Fields matching secret-like names (`access_token`, `private_key`, `upstream_api_key`, `*_secret`, `*_token`) are rejected at write time, so a code bug can't leak a value into the log.
+- **Secretless static-key forwarding.** When explicitly enabled, the proxy binds only to an explicit loopback IP, accepts opaque expiring capabilities, checks exact methods and routes, rejects ambiguous HTTP framing and duplicate headers, strips caller authorization and both static and `Connection`-nominated hop-by-hop headers, disables redirects, and writes an audit attempt before dispatch plus exactly one completion/failure event without recording either credential. HTTPS upstreams are required unless insecure HTTP is explicitly enabled with the literal boolean `true` for controlled local testing. Request/response sizes, concurrent workers, total downstream request duration, and total upstream duration are bounded. The credential-bearing upstream operation runs in a short-lived worker process so an absolute deadline can terminate a trickling connection.
 - **Systemd hardening.** `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `LockPersonality`.
 
 ## Development
@@ -269,16 +296,23 @@ uv pip install -e '.[test]'
 uv run pytest -v
 ```
 
-The full test suite (54 tests) covers policy parsing, lease persistence, audit-log sanitization, peer-credential resolution, each provider's issue logic, the Bitwarden resolver, the HTTP handler, the CLI (including `keyholder doctor`'s individual checks), and a fake-provider end-to-end round trip.
+The full test suite covers policy parsing, lease persistence, audit-log sanitization, peer-credential resolution, each provider's issue logic, capability authorization and lifecycle, proxy forwarding and audit behavior, the Bitwarden resolver, the Unix-socket HTTP handler, the CLI (including `keyholder doctor`'s individual checks), and a fake-provider end-to-end round trip.
 
 ## Roadmap
 
-The daemon and CLI are complete. Two meaningful gaps remain before keyholder covers every credential shape an automation might need:
+The next meaningful gaps are:
 
-1. **Local proxy consumer** — `LocalProxyProvider` mints opaque `khcap_…` capability tokens today, but nothing accepts them yet. The next major piece is a second HTTP listener inside the daemon that receives requests bearing a capability token, validates it against the lease store, checks the request path against the grant's allowlist, and forwards to the configured upstream with the *real* API key attached. That unlocks scoped, revocable, audit-logged access to third-party APIs whose long-lived keys never rotate (OpenRouter, OpenAI, Stripe, etc.).
+1. **Streaming proxy responses** — the local proxy currently buffers request and response bodies. Add transparent streaming, including SSE, while preserving body limits, audit semantics, revocation checks, and header sanitization.
 2. **Run-as-caller** — today `keyholder run` executes the child subprocess as the daemon's own user (`keyholder`), which means CLIs that need caller-owned config (`gh`, `git` with your SSH keys, `aws` with your `~/.aws`) can't find it. Works fine for env-only tools like `curl`. Fixing this cleanly needs either a small setuid helper or a redesign that hands the token back with an exec envelope.
+3. **Richer proxy authentication adapters** — bearer injection is implemented. Header-key, query-key, request-signing, and protocol-specific adapters remain future work.
 
-Other niceties: `GET /v1/leases` + `keyholder leases` for visibility, `SIGHUP` policy reload, a background sweep for expired lease rows, and a socket-activated systemd unit.
+Other niceties: `GET /v1/leases` + `keyholder leases` for visibility, `SIGHUP` policy reload, cleanup of expired SQLite lease rows, and a socket-activated systemd unit.
+
+Proxy capabilities are intentionally in-memory and fail closed across daemon
+restarts. Existing SQLite lease rows may remain visible, but callers must issue
+a new capability after restart. Buffered forwarding also incurs one short-lived
+worker process per upstream request; streaming and a persistent bounded worker
+pool are future optimizations.
 
 ## Documentation
 
