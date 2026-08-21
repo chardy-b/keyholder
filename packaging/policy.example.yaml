@@ -55,8 +55,8 @@ callers:
             max_ttl_seconds: 600
             upstream_base_url: https://openrouter.ai/api
             bitwarden_refs:
-              upstream_api_key: "openrouter-api-key"
+              upstream_api_key: "key:openrouter"
             allowed_methods:
               - POST
             allowed_routes:
-              - /v1/chat/completions
+              - /api/v1/chat/completions

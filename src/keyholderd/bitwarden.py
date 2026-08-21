@@ -46,11 +46,33 @@ class BwsResolver:
             if expires_at > now:
                 LOG.debug("Bitwarden cache hit for configured secret ref %s", secret_ref)
                 return value
-        cmd = ["bws", "secret", "get", secret_ref, "--output", "json"]
+
+        fetch_ref = secret_ref
+        if secret_ref.startswith("key:"):
+            key = secret_ref[4:]
+            if not isinstance(self.project_id, str) or not self.project_id.strip():
+                raise BitwardenError("Bitwarden project is required for key references")
+            list_cmd = ["bws", "secret", "list", self.project_id, "--output", "json"]
+            LOG.debug("Looking up Bitwarden secret key %s in configured project", key)
+            listed = self.runner(list_cmd, capture_output=True, text=True, env=self._env(), timeout=30)
+            if listed.returncode != 0:
+                raise BitwardenError("bws failed listing secrets for key reference")
+            try:
+                entries = json.loads(listed.stdout)
+            except json.JSONDecodeError as exc:
+                raise BitwardenError("bws returned invalid JSON while listing key references") from exc
+            if not isinstance(entries, list):
+                raise BitwardenError("bws returned an invalid secret list")
+            matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("key") == key]
+            if len(matches) != 1 or not isinstance(matches[0].get("id"), str) or not matches[0]["id"]:
+                raise BitwardenError("Bitwarden key reference did not resolve to exactly one secret")
+            fetch_ref = matches[0]["id"]
+
+        cmd = ["bws", "secret", "get", fetch_ref, "--output", "json"]
         LOG.debug("Resolving Bitwarden secret ref %s via bws", secret_ref)
         result = self.runner(cmd, capture_output=True, text=True, env=self._env(), timeout=30)
         if result.returncode != 0:
-            raise BitwardenError(f"bws failed resolving {secret_ref!r}: {result.stderr.strip() or 'unknown error'}")
+            raise BitwardenError(f"bws failed resolving {secret_ref!r}")
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
