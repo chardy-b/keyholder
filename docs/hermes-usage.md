@@ -31,7 +31,10 @@ keyholder issue openrouter-chat-proxy --ttl 300 --reason "call OpenRouter throug
 Use the returned capability as the bearer token and
 `http://127.0.0.1:8787` as the API base. The local listener validates the
 capability and substitutes the real upstream bearer credential only while
-forwarding an allowed request. Never configure `allow_insecure_http: true` for
+forwarding an allowed request. The example policy uses the Bitwarden reference
+`key:openrouter` and permits `/v1/chat/completions`; with
+`upstream_base_url: https://openrouter.ai/api`, do not include `/api` in the
+allowed route. Never configure `allow_insecure_http: true` for
 an Internet upstream; that option exists only for controlled local testing.
 The opt-in must be the YAML boolean `true`; quoted values such as `"true"` or
 `"false"` are rejected rather than interpreted by truthiness.

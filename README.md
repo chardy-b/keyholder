@@ -237,7 +237,7 @@ callers:
             max_ttl_seconds: 600
             upstream_base_url: https://openrouter.ai/api
             bitwarden_refs:
-              upstream_api_key: "<bws-secret-uuid>"
+              upstream_api_key: "key:openrouter"
             allowed_methods: [POST]
             allowed_routes: [/v1/chat/completions]
 ```
