@@ -216,7 +216,7 @@ callers:
             app_id: 1234567
             installation_id: 12345678
             bitwarden_refs:
-              private_key_pem: "<bws-secret-uuid>"
+              private_key_pem: "key:github-app-private-key-pem"
             permissions:
               metadata: read
               contents: read
@@ -228,8 +228,8 @@ callers:
             role_arn: "arn:aws:iam::123456789012:role/logs-read"
             external_id: "keyholder-local"
             bitwarden_refs:
-              aws_access_key_id:     "<bws-secret-uuid>"
-              aws_secret_access_key: "<bws-secret-uuid>"
+              aws_access_key_id:     "key:aws-source-access-key-id"
+              aws_secret_access_key: "key:aws-source-secret-access-key"
 
           - name: openrouter-chat-proxy
             provider: local_proxy
@@ -237,10 +237,15 @@ callers:
             max_ttl_seconds: 600
             upstream_base_url: https://openrouter.ai/api
             bitwarden_refs:
-              upstream_api_key: "<bws-secret-uuid>"
+              upstream_api_key: "key:openrouter"
             allowed_methods: [POST]
             allowed_routes: [/v1/chat/completions]
 ```
+
+Bitwarden references in policy examples must use either a canonical UUID string
+or `key:<nonblank-name>`. A `key:` reference is matched exactly within the
+configured Bitwarden project. These examples use placeholders only; never put
+a real secret ID or secret value in tracked documentation.
 
 See [`packaging/policy.example.yaml`](packaging/policy.example.yaml) for a fuller starter policy.
 
