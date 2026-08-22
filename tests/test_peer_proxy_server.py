@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import grp
 import socket
 import stat
 import threading
@@ -175,6 +176,44 @@ def test_socket_parent_rejects_group_writable_and_symlink_parents(tmp_path):
     link.symlink_to(real, target_is_directory=True)
     with pytest.raises(server.ServerError):
         server.PeerProxyHTTPServer(str(link / "peer.sock"), policy(tmp_path, []), FakeResolver())
+
+
+def test_serve_lifecycle_starts_and_cleans_peer_proxy(tmp_path, monkeypatch):
+    config_path = tmp_path / "policy.json"
+    control_path = tmp_path / "control.sock"
+    peer_path = tmp_path / "peer.sock"
+    group_name = grp.getgrgid(os.getgid()).gr_name
+    config = policy(tmp_path, [grant()])
+    config["proxy"]["unix_socket_path"] = str(peer_path)
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr(server, "_resolver", lambda config: FakeResolver())
+    threads = []
+    original_thread = server.threading.Thread
+
+    def recording_thread(*args, **kwargs):
+        thread = original_thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(server.threading, "Thread", recording_thread)
+    original_control_server = server.UnixHTTPServer
+
+    class ControlledControlServer(original_control_server):
+        def serve_forever(self, poll_interval=0.5):
+            assert peer_path.exists()
+            peer_stat = os.stat(peer_path)
+            assert peer_stat.st_gid == os.getgid()
+            assert stat.S_IMODE(peer_stat.st_mode) == 0o640
+            raise RuntimeError("controlled serve termination")
+
+    monkeypatch.setattr(server, "UnixHTTPServer", ControlledControlServer)
+    with pytest.raises(RuntimeError, match="controlled serve termination"):
+        server.serve(str(config_path), str(control_path), socket_group=group_name)
+    assert not peer_path.exists()
+    assert not control_path.exists()
+    peer_threads = [thread for thread in threads if thread.name == "keyholder-peer-proxy"]
+    assert len(peer_threads) == 1
+    assert not peer_threads[0].is_alive()
 
 
 def test_overlapping_requests_use_unique_internal_cleanup(tmp_path, monkeypatch):
