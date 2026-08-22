@@ -49,9 +49,9 @@ The TCP flow above uses the legacy `openrouter-chat-proxy` capability grant and
 `keyholder issue`/`keyholder run`; the UDS flow uses the separate
 `openrouter-chat-peer-proxy` grant and has no token or `keyholder run` step.
 
-The peer endpoint requires exactly one matching `local_proxy` grant named
-`openrouter-chat-peer-proxy` with
-`authentication: peercred`, `allowed_methods: [POST]`,
+The peer endpoint requires exactly one matching `local_proxy` grant with
+`authentication: peercred`; `openrouter-chat-peer-proxy` is the example name.
+The grant must set `allowed_methods: [POST]`,
 `allowed_routes: [/v1/chat/completions]`, and exactly
 `allowed_models: [stealth/ox-alpha]`. Its `bitwarden_refs` may contain only a
 reference such as `upstream_api_key: "key:openrouter"`; never put the upstream

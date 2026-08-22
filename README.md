@@ -107,7 +107,7 @@ sudo chmod 0640 /etc/keyholder/bws-access-token.cred
 Verify with:
 
 ```bash
-sudo systemd-creds decrypt --name=bws-access-token /etc/keyholder/bws-access-token.cred - | head -c 20; echo
+sudo systemd-creds decrypt --name=bws-access-token /etc/keyholder/bws-access-token.cred - >/dev/null
 ```
 
 **This file is sealed to the host's key/TPM and cannot be copied between machines** — every host encrypts its own copy (see [Replicating to another machine](#replicating-to-another-machine)).
@@ -271,8 +271,8 @@ authentication. Set `unix_socket_group` to the dedicated client group and use
 `unix_socket_mode: "0o660"` (or `"0o600"` when no group access is needed).
 The daemon owns the socket and removes/recreates it during its lifecycle.
 It fails closed on unsafe parents, non-socket stale paths, unsafe modes, or
-missing/ambiguous peer grants. The separate `openrouter-chat-peer-proxy`
-grant must explicitly use
+missing/ambiguous peer grants. One eligible peer-credential grant is required;
+`openrouter-chat-peer-proxy` is the example grant name. It must explicitly use
 `authentication: peercred`, POST `/v1/chat/completions`, and
 `allowed_models: [stealth/ox-alpha]`; its Bitwarden reference is the only
 location for the upstream key, which is never placed in Hermes.
