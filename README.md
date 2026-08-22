@@ -238,6 +238,15 @@ callers:
 
           - name: openrouter-chat-proxy
             provider: local_proxy
+            ttl_seconds: 300
+            max_ttl_seconds: 600
+            upstream_base_url: https://openrouter.ai/api
+            bitwarden_refs:
+              upstream_api_key: "key:openrouter"
+            allowed_methods: [POST]
+            allowed_routes: [/v1/chat/completions]
+          - name: openrouter-chat-peer-proxy
+            provider: local_proxy
             authentication: peercred
             ttl_seconds: 300
             max_ttl_seconds: 600
@@ -262,7 +271,8 @@ authentication. Set `unix_socket_group` to the dedicated client group and use
 `unix_socket_mode: "0o660"` (or `"0o600"` when no group access is needed).
 The daemon owns the socket and removes/recreates it during its lifecycle.
 It fails closed on unsafe parents, non-socket stale paths, unsafe modes, or
-missing/ambiguous peer grants. The peer grant must explicitly use
+missing/ambiguous peer grants. The separate `openrouter-chat-peer-proxy`
+grant must explicitly use
 `authentication: peercred`, POST `/v1/chat/completions`, and
 `allowed_models: [stealth/ox-alpha]`; its Bitwarden reference is the only
 location for the upstream key, which is never placed in Hermes.
@@ -305,6 +315,10 @@ keyholder revoke lease_abc123def --reason "no longer needed"
 # bearer token against the loopback listener instead of the real upstream key
 keyholder issue openrouter-chat-proxy --ttl 300 --reason "OpenRouter chat request"
 # API base: http://127.0.0.1:8787
+
+# The Unix-socket endpoint uses the separate peercred grant; it does not issue
+# or accept a bearer capability token. Authentication is the caller's Linux
+# process identity (SO_PEERCRED), not a Keyholder lease.
 
 # Self-diagnose this host: systemd version, bws on PATH, service state, socket
 # perms, group membership, policy/credential presence, and a live grants check

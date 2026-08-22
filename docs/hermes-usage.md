@@ -45,8 +45,12 @@ to enable it. Use `unix_socket_group: keyholder-clients` and
 `unix_socket_mode: "0o660"` (the only safe modes are owner read/write with
 optional group read/write). The parent directory must not be writable by group
 or other users. `SO_PEERCRED` identifies the process; do not add a bearer token.
+The TCP flow above uses the legacy `openrouter-chat-proxy` capability grant and
+`keyholder issue`/`keyholder run`; the UDS flow uses the separate
+`openrouter-chat-peer-proxy` grant and has no token or `keyholder run` step.
 
-The peer endpoint requires exactly one matching `local_proxy` grant with
+The peer endpoint requires exactly one matching `local_proxy` grant named
+`openrouter-chat-peer-proxy` with
 `authentication: peercred`, `allowed_methods: [POST]`,
 `allowed_routes: [/v1/chat/completions]`, and exactly
 `allowed_models: [stealth/ox-alpha]`. Its `bitwarden_refs` may contain only a

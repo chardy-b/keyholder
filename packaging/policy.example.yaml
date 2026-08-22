@@ -61,6 +61,17 @@ callers:
               profile: default
           - name: openrouter-chat-proxy
             provider: local_proxy
+            ttl_seconds: 300
+            max_ttl_seconds: 600
+            upstream_base_url: https://openrouter.ai/api
+            bitwarden_refs:
+              upstream_api_key: "key:openrouter"
+            allowed_methods:
+              - POST
+            allowed_routes:
+              - /v1/chat/completions
+          - name: openrouter-chat-peer-proxy
+            provider: local_proxy
             authentication: peercred
             ttl_seconds: 300
             max_ttl_seconds: 600
