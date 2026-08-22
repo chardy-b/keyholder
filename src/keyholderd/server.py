@@ -10,6 +10,8 @@ import socketserver
 import subprocess
 import grp
 import threading
+import stat
+import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -18,7 +20,8 @@ from .audit import write_audit_event
 from .bitwarden import BwsResolver
 from .leases import LeaseStore
 from .peercred import get_peercred, uid_to_name
-from .policy import PolicyError, get_grant, grants_for_caller, load_policy, validate_ttl
+from .policy import PolicyError, get_grant, get_peercred_proxy_grant, grants_for_caller, load_policy, validate_ttl
+from .proxy import ProxyRequestError, ProxyAuthorizationError, forward_request, validated_proxy_grant, validated_content_length, read_exact_body, validated_header_items
 from .providers.aws_sts import AwsStsProvider
 from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
@@ -158,6 +161,65 @@ def create_proxy_server(config: dict[str, Any]) -> ProxyHTTPServer:
     )
 
 
+def validate_peer_proxy_socket_path(path: str) -> None:
+    if not path or not os.path.isabs(path) or ".." in path.split(os.sep):
+        raise ServerError("proxy unix socket path must be absolute and contain no traversal", 500)
+    if os.path.exists(path) and not stat.S_ISSOCK(os.stat(path).st_mode):
+        raise ServerError("proxy unix socket path is not a socket", 500)
+
+
+class PeerProxyHTTPServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    def __init__(self, socket_path: str, config: dict[str, Any], resolver: BwsResolver):
+        validate_peer_proxy_socket_path(socket_path)
+        if os.path.exists(socket_path): os.unlink(socket_path)
+        self.config, self.resolver = config, resolver
+        super().__init__(socket_path, PeerProxyHandler)
+
+
+class PeerProxyHandler(BaseHTTPRequestHandler):
+    server: PeerProxyHTTPServer
+    def log_message(self, format: str, *args: Any) -> None: LOG.info(format, *args)
+    def _send(self, status: int, payload: bytes) -> None:
+        self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+    def _handle(self) -> None:
+        try:
+            if self.request_version != "HTTP/1.1" or not self.path.startswith("/"):
+                raise ProxyRequestError("origin-form HTTP/1.1 is required")
+            headers = validated_header_items(list(self.headers.raw_items()))
+            if any(name.lower() == "authorization" for name in headers):
+                raise ProxyAuthorizationError("Authorization header is not accepted")
+            _pid, uid, _gid = get_peercred(self.connection)  # type: ignore[arg-type]
+            caller = uid_to_name(uid)
+            grant = get_peercred_proxy_grant(self.server.config, caller, "default")
+            secrets_map = self.server.resolver.resolve_refs(grant.get("bitwarden_refs", {}))
+            validated_proxy_grant(grant, secrets_map)
+            raw = list(self.headers.raw_items())
+            length = validated_content_length([v for n,v in raw if n.lower()=="content-length"], transfer_encoding=next((v for n,v in raw if n.lower()=="transfer-encoding"), None), max_body_bytes=8*1024*1024)
+            body = read_exact_body(self.rfile, length)
+            provider = PROVIDERS["local_proxy"]
+            assert isinstance(provider, LocalProxyProvider)
+            from datetime import UTC, datetime, timedelta
+            token = "_peercred_internal_" + secrets.token_urlsafe(16)
+            provider.store.register(token=token, lease_id="peercred-request", grant=grant, secrets=secrets_map, expires_at=datetime.now(UTC)+timedelta(seconds=30), caller=caller, grant_name=str(grant.get("name", "")))
+            try:
+                result = forward_request(provider.store, token=token, method=self.command, target=self.path, headers=headers, body=body, audit_path=_audit_paths(self.server.config)[1])
+            finally:
+                provider.store.revoke_lease("peercred-request")
+            self._send(result.status, result.body)
+        except (PolicyError, ProxyAuthorizationError, ProxyRequestError) as exc:
+            write_audit_event(_audit_paths(self.server.config)[1], {"event":"proxy_rejected", "caller":"unknown", "profile":"default", "grant":"", "provider":"local_proxy", "ttl_seconds":0, "lease_id":"", "reason":"peer proxy request rejected", "method":self.command, "route":"", "failure_type":type(exc).__name__})
+            self._send(getattr(exc, "status", 403), json.dumps({"error": str(exc)}).encode())
+        except Exception:
+            LOG.exception("peer proxy request failed")
+            self._send(500, b'{"error":"proxy request failed"}')
+    do_POST = _handle
+    do_GET = _handle
+    do_PUT = _handle
+    do_PATCH = _handle
+    do_DELETE = _handle
+
+
 class KeyholderHandler(BaseHTTPRequestHandler):
     server: UnixHTTPServer
     def log_message(self, format: str, *args: Any) -> None:
@@ -202,6 +264,14 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None) -
     config = load_policy(config_path)
     proxy_server = create_proxy_server(config) if proxy_listener_enabled(config) else None
     proxy_thread = None
+    peer_proxy = None
+    peer_thread = None
+    unix_proxy_path = config.get("proxy", {}).get("unix_socket_path")
+    if unix_proxy_path:
+        peer_proxy = PeerProxyHTTPServer(str(unix_proxy_path), config, _resolver(config))
+        os.chmod(str(unix_proxy_path), 0o660)
+        peer_thread = threading.Thread(target=peer_proxy.serve_forever, name="keyholder-peer-proxy", daemon=True)
+        peer_thread.start()
     if proxy_server is not None:
         proxy_thread = threading.Thread(target=proxy_server.serve_forever, name="keyholder-proxy", daemon=True)
         proxy_thread.start()

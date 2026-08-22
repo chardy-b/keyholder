@@ -45,6 +45,15 @@ def get_grant(policy: dict[str, Any], uid_name: str, profile: str, grant_name: s
     raise PolicyError(f"grant {grant_name!r} is not available for caller {uid_name!r} profile {profile!r}")
 
 
+def get_peercred_proxy_grant(policy: dict[str, Any], uid_name: str, profile: str) -> dict[str, Any]:
+    matches = [g for g in grants_for_caller(policy, uid_name, profile)
+               if isinstance(g, dict) and g.get("provider") == "local_proxy"
+               and g.get("authentication") == "peercred"]
+    if len(matches) != 1:
+        raise PolicyError("caller must have exactly one eligible peer-credential proxy grant")
+    return matches[0]
+
+
 def validate_ttl(grant: dict[str, Any], requested_ttl: int | None) -> int:
     default = int(grant.get("ttl_seconds", 300))
     max_ttl = int(grant.get("max_ttl_seconds", default))
