@@ -529,12 +529,17 @@ def forward_request(
             assert capability.allowed_models is not None
             try:
                 validate_peercred_chat_body(body, capability.allowed_models)
-            except ProxyRequestError:
+            except ProxyRequestError as exc:
                 if audit_path is not None:
                     write_audit_event(
                         audit_path,
                         {"event": "proxy_rejected", **audit_base, "failure_type": "model_validation"},
                     )
+                # The HTTP handler must not emit a second terminal rejection.
+                try:
+                    setattr(exc, "_keyholder_rejection_audited", True)
+                except (AttributeError, TypeError):
+                    pass
                 raise
         upstream_headers = _forward_headers(headers)
         upstream_headers["Authorization"] = f"Bearer {capability.upstream_api_key}"
@@ -788,7 +793,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             status = 401 if str(exc) in {"bearer capability is required", "invalid capability"} else 403
             self._error(status, str(exc))
         except ProxyRequestError as exc:
-            self._audit_rejection("proxy_rejected", type(exc).__name__)
+            if not getattr(exc, "_keyholder_rejection_audited", False):
+                self._audit_rejection("proxy_rejected", type(exc).__name__)
             self._error(exc.status, str(exc))
         except (requests.RequestException, ProxyUpstreamError, OSError, ValueError) as exc:
             if not getattr(exc, "_keyholder_audited", False):
