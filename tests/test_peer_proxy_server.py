@@ -152,6 +152,31 @@ def test_socket_mode_is_preserved(tmp_path):
         os.unlink(srv.server_address)
 
 
+@pytest.mark.parametrize("value", [0o600, 0o660, "0600", "0o660"])
+def test_socket_mode_accepts_safe_canonical_values(value):
+    assert server.validate_unix_socket_mode(value) in {0o600, 0o660}
+
+
+@pytest.mark.parametrize("value", [0o666, 0o777, "0666", "0777", "660", "0o66", "0O660", "garbage", True])
+def test_socket_mode_rejects_unsafe_or_malformed_values(value):
+    with pytest.raises(server.ServerError):
+        server.validate_unix_socket_mode(value)
+
+
+def test_socket_parent_rejects_group_writable_and_symlink_parents(tmp_path):
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o770)
+    with pytest.raises(server.ServerError):
+        server.PeerProxyHTTPServer(str(unsafe / "peer.sock"), policy(tmp_path, []), FakeResolver())
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(server.ServerError):
+        server.PeerProxyHTTPServer(str(link / "peer.sock"), policy(tmp_path, []), FakeResolver())
+
+
 def test_overlapping_requests_use_unique_internal_cleanup(tmp_path, monkeypatch):
     lease_ids = []
     entered = threading.Barrier(3)

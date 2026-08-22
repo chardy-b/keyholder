@@ -12,6 +12,7 @@ import grp
 import threading
 import stat
 import secrets
+import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -161,18 +162,57 @@ def create_proxy_server(config: dict[str, Any]) -> ProxyHTTPServer:
     )
 
 
-def validate_peer_proxy_socket_path(path: str) -> None:
-    if not path or not os.path.isabs(path) or ".." in path.split(os.sep):
+def validate_unix_socket_mode(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ServerError("unix_socket_mode must be an octal mode", 500)
+    if isinstance(value, int):
+        mode = value
+    elif isinstance(value, str) and (re.fullmatch(r"0o[0-7]{3}", value) or re.fullmatch(r"0[0-7]{3}", value)):
+        mode = int(value, 8)
+    else:
+        raise ServerError("unix_socket_mode must be a canonical octal mode", 500)
+    if mode & ~0o660 or mode & 0o600 != 0o600:
+        raise ServerError("unix_socket_mode must provide owner read/write and no unsafe bits", 500)
+    return mode
+
+
+def _socket_parent(path: str) -> tuple[int, str]:
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    if not path or not os.path.isabs(path) or not name or name in {".", ".."} or "/" in name or ".." in path.split(os.sep):
         raise ServerError("proxy unix socket path must be absolute and contain no traversal", 500)
-    if os.path.exists(path) and not stat.S_ISSOCK(os.stat(path).st_mode):
-        raise ServerError("proxy unix socket path is not a socket", 500)
+    info = os.lstat(parent)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ServerError("proxy unix socket parent must be a real directory", 500)
+    if info.st_uid not in {os.geteuid(), 0} or info.st_mode & 0o022:
+        raise ServerError("proxy unix socket parent is unsafe", 500)
+    return os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)), name
+
+
+def validate_peer_proxy_socket_path(path: str) -> None:
+    fd, name = _socket_parent(path)
+    try:
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(info.st_mode):
+            raise ServerError("proxy unix socket path is not a socket", 500)
+    finally:
+        os.close(fd)
 
 
 class PeerProxyHTTPServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     def __init__(self, socket_path: str, config: dict[str, Any], resolver: BwsResolver):
         validate_peer_proxy_socket_path(socket_path)
-        if os.path.exists(socket_path): os.unlink(socket_path)
+        parent_fd, socket_name = _socket_parent(socket_path)
+        try:
+            try:
+                os.unlink(socket_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(parent_fd)
         self.config, self.resolver = config, resolver
         proxy_config = config.get("proxy", {})
         self.request_timeout_seconds = float(proxy_config.get("request_timeout_seconds", 15))
@@ -180,11 +220,12 @@ class PeerProxyHTTPServer(socketserver.ThreadingUnixStreamServer):
         if self.request_timeout_seconds <= 0 or self.max_workers <= 0:
             raise ServerError("proxy resource limits must be positive", 500)
         self._worker_slots = threading.BoundedSemaphore(self.max_workers)
+        socket_mode = validate_unix_socket_mode(proxy_config.get("unix_socket_mode", "0o660"))
         super().__init__(socket_path, PeerProxyHandler)
         group = proxy_config.get("unix_socket_group")
         if group:
             os.chown(socket_path, -1, grp.getgrnam(str(group)).gr_gid)
-        os.chmod(socket_path, int(proxy_config.get("unix_socket_mode", "0o660"), 8) if isinstance(proxy_config.get("unix_socket_mode", "0o660"), str) else int(proxy_config.get("unix_socket_mode", 0o660)))
+        os.chmod(socket_path, socket_mode, follow_symlinks=False)
 
     def get_request(self) -> tuple[Any, Any]:
         request, address = super().get_request()
