@@ -117,6 +117,50 @@ def test_peercred_grant_rejects_disallowed_model_before_forwarding():
     assert sender_called is False
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"model":"stealth/ox-alpha",',
+        b'{"messages":[],"credential":"credential-secret","capability":"capability-secret"}',
+        b'{"model":123,"credential":"credential-secret","capability":"capability-secret"}',
+        b'{"model":"other-model","credential":"credential-secret","capability":"capability-secret"}',
+    ],
+)
+def test_peercred_model_rejection_audits_once_after_attempt_without_sensitive_values(tmp_path, body):
+    store = CapabilityStore()
+    store.register(
+        token="khcap_peercred_audit",
+        lease_id="lease_peercred_audit",
+        grant={
+            "authentication": "peercred",
+            "upstream_base_url": "https://api.example.test",
+            "allowed_routes": ["/v1/chat/completions"],
+            "allowed_models": ["stealth/ox-alpha"],
+        },
+        secrets={"upstream_api_key": "credential-secret"},
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    audit_path = str(tmp_path / "audit.jsonl")
+
+    with pytest.raises(ProxyRequestError):
+        forward_request(
+            store,
+            token="khcap_peercred_audit",
+            method="POST",
+            target="/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            body=body,
+            sender=lambda **kwargs: pytest.fail("rejected request was forwarded"),
+            audit_path=audit_path,
+        )
+
+    events = [json.loads(line) for line in open(audit_path, encoding="utf-8")]
+    assert [event["event"] for event in events] == ["proxy_attempt", "proxy_rejected"]
+    rejection_line = open(audit_path, encoding="utf-8").read().splitlines()[1]
+    for sensitive in ("stealth/ox-alpha", "other-model", "credential-secret", "capability-secret"):
+        assert sensitive not in rejection_line
+
+
 def test_existing_capability_grant_does_not_require_model_allowlist():
     CapabilityStore().register(
         token="khcap_existing",

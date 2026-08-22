@@ -527,7 +527,15 @@ def forward_request(
             # Peer-credential grants are renewable, so the model boundary is
             # enforced on every request rather than by a short-lived token.
             assert capability.allowed_models is not None
-            validate_peercred_chat_body(body, capability.allowed_models)
+            try:
+                validate_peercred_chat_body(body, capability.allowed_models)
+            except ProxyRequestError:
+                if audit_path is not None:
+                    write_audit_event(
+                        audit_path,
+                        {"event": "proxy_rejected", **audit_base, "failure_type": "model_validation"},
+                    )
+                raise
         upstream_headers = _forward_headers(headers)
         upstream_headers["Authorization"] = f"Bearer {capability.upstream_api_key}"
         try:
