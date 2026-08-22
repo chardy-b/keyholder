@@ -307,7 +307,6 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None) -
     unix_proxy_path = config.get("proxy", {}).get("unix_socket_path")
     if unix_proxy_path:
         peer_proxy = PeerProxyHTTPServer(str(unix_proxy_path), config, _resolver(config))
-        os.chmod(str(unix_proxy_path), 0o660)
         peer_thread = threading.Thread(target=peer_proxy.serve_forever, name="keyholder-peer-proxy", daemon=True)
         peer_thread.start()
     if proxy_server is not None:
