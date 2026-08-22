@@ -154,11 +154,11 @@ def create_proxy_server(config: dict[str, Any]) -> ProxyHTTPServer:
         (host, int(proxy_config.get("port", 8787))),
         store=provider.store,
         audit_path=audit_path,
-        max_body_bytes=int(proxy_config.get("max_body_bytes", 8 * 1024 * 1024)),
-        max_response_bytes=int(proxy_config.get("max_response_bytes", 8 * 1024 * 1024)),
-        max_workers=int(proxy_config.get("max_workers", 16)),
-        request_timeout_seconds=float(proxy_config.get("request_timeout_seconds", 15)),
-        upstream_timeout_seconds=float(proxy_config.get("upstream_timeout_seconds", 30)),
+        max_body_bytes=proxy_config.get("max_body_bytes", 8 * 1024 * 1024),
+        max_response_bytes=proxy_config.get("max_response_bytes", 8 * 1024 * 1024),
+        max_workers=proxy_config.get("max_workers", 16),
+        request_timeout_seconds=proxy_config.get("request_timeout_seconds", 15),
+        upstream_timeout_seconds=proxy_config.get("upstream_timeout_seconds", 30),
     )
 
 

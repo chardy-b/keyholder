@@ -1,7 +1,11 @@
 import json
 import os
 import sys
+
+import pytest
+
 from keyholderd import server
+from keyholderd.proxy import ProxyConfigurationError
 
 
 def config(tmp_path):
@@ -39,3 +43,46 @@ def test_ttl_above_max_fails(tmp_path):
         assert "exceeds max" in str(exc)
     else:
         raise AssertionError("expected failure")
+
+
+def proxy_config(tmp_path, **overrides):
+    values = {
+        "host": "127.0.0.1", "port": 0, "max_body_bytes": 4096,
+        "max_response_bytes": 8192, "max_workers": 3,
+        "request_timeout_seconds": 7, "upstream_timeout_seconds": 9,
+    }
+    values.update(overrides)
+    return {"proxy": values, "paths": {"audit_log": str(tmp_path / "audit.jsonl")}}
+
+
+@pytest.mark.parametrize("field", ["max_body_bytes", "max_response_bytes", "max_workers"])
+@pytest.mark.parametrize("value", ["4096", "not-a-number"])
+def test_tcp_proxy_factory_rejects_non_numeric_integer_limits_before_listening(tmp_path, field, value):
+    with pytest.raises(ProxyConfigurationError):
+        server.create_proxy_server(proxy_config(tmp_path, **{field: value}))
+
+
+@pytest.mark.parametrize("field", ["request_timeout_seconds", "upstream_timeout_seconds"])
+@pytest.mark.parametrize("value", ["7", "not-a-number", float("nan"), float("inf"), -1, 0])
+def test_tcp_proxy_factory_rejects_invalid_timeout_limits_before_listening(tmp_path, field, value):
+    with pytest.raises(ProxyConfigurationError):
+        server.create_proxy_server(proxy_config(tmp_path, **{field: value}))
+
+
+@pytest.mark.parametrize("field", ["max_body_bytes", "max_response_bytes", "max_workers"])
+def test_tcp_proxy_factory_rejects_invalid_positive_constraints_before_listening(tmp_path, field):
+    with pytest.raises(ProxyConfigurationError):
+        server.create_proxy_server(proxy_config(tmp_path, **{field: 0}))
+
+
+def test_tcp_proxy_factory_accepts_normal_numeric_config(tmp_path):
+    proxy_server = server.create_proxy_server(proxy_config(tmp_path))
+    try:
+        assert proxy_server.server_address[1] > 0
+        assert proxy_server.max_body_bytes == 4096
+        assert proxy_server.max_response_bytes == 8192
+        assert proxy_server.max_workers == 3
+        assert proxy_server.request_timeout_seconds == 7
+        assert proxy_server.upstream_timeout_seconds == 9
+    finally:
+        proxy_server.server_close()
