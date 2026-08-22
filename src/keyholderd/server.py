@@ -22,7 +22,7 @@ from .bitwarden import BwsResolver
 from .leases import LeaseStore
 from .peercred import get_peercred, uid_to_name
 from .policy import PolicyError, get_grant, get_peercred_proxy_grant, grants_for_caller, load_policy, validate_ttl
-from .proxy import ProxyRequestError, ProxyAuthorizationError, forward_request, validated_proxy_grant, validated_content_length, read_exact_body, validated_header_items
+from .proxy import ProxyRequestError, ProxyAuthorizationError, forward_request, validated_proxy_grant, validated_content_length, read_exact_body, validated_header_items, validate_proxy_resource_limits
 from .providers.aws_sts import AwsStsProvider
 from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
@@ -205,6 +205,15 @@ class PeerProxyHTTPServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     def __init__(self, socket_path: str, config: dict[str, Any], resolver: BwsResolver):
         validate_peer_proxy_socket_path(socket_path)
+        self.config, self.resolver = config, resolver
+        proxy_config = config.get("proxy", {})
+        limits = validate_proxy_resource_limits(
+            max_body_bytes=proxy_config.get("max_body_bytes", 8 * 1024 * 1024),
+            max_response_bytes=proxy_config.get("max_response_bytes", 8 * 1024 * 1024),
+            request_timeout_seconds=proxy_config.get("request_timeout_seconds", 15),
+            upstream_timeout_seconds=proxy_config.get("upstream_timeout_seconds", 30),
+            max_workers=proxy_config.get("max_workers", 16),
+        )
         parent_fd, socket_name = _socket_parent(socket_path)
         try:
             try:
@@ -213,12 +222,8 @@ class PeerProxyHTTPServer(socketserver.ThreadingUnixStreamServer):
                 pass
         finally:
             os.close(parent_fd)
-        self.config, self.resolver = config, resolver
-        proxy_config = config.get("proxy", {})
-        self.request_timeout_seconds = float(proxy_config.get("request_timeout_seconds", 15))
-        self.max_workers = int(proxy_config.get("max_workers", 16))
-        if self.request_timeout_seconds <= 0 or self.max_workers <= 0:
-            raise ServerError("proxy resource limits must be positive", 500)
+        self.request_timeout_seconds = limits[2]
+        self.max_workers = limits[4]
         self._worker_slots = threading.BoundedSemaphore(self.max_workers)
         socket_mode = validate_unix_socket_mode(proxy_config.get("unix_socket_mode", "0o660"))
         super().__init__(socket_path, PeerProxyHandler)

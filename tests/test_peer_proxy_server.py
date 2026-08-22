@@ -178,6 +178,48 @@ def test_socket_parent_rejects_group_writable_and_symlink_parents(tmp_path):
         server.PeerProxyHTTPServer(str(link / "peer.sock"), policy(tmp_path, []), FakeResolver())
 
 
+@pytest.mark.parametrize("field", [
+    "max_body_bytes", "max_response_bytes", "request_timeout_seconds",
+    "upstream_timeout_seconds", "max_workers",
+])
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "not-a-number"])
+def test_peer_proxy_resource_limits_fail_closed_without_socket(tmp_path, field, value):
+    path = tmp_path / "peer.sock"
+    config = policy(tmp_path, [])
+    config["proxy"][field] = value
+    with pytest.raises(Exception):
+        server.PeerProxyHTTPServer(str(path), config, FakeResolver())
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("field", ["max_body_bytes", "max_response_bytes"])
+def test_peer_proxy_rejects_oversized_byte_limits_without_socket(tmp_path, field):
+    path = tmp_path / "peer.sock"
+    config = policy(tmp_path, [])
+    config["proxy"][field] = 64 * 1024 * 1024 + 1
+    with pytest.raises(Exception):
+        server.PeerProxyHTTPServer(str(path), config, FakeResolver())
+    assert not path.exists()
+
+
+def test_peer_proxy_accepts_valid_boundary_limits(tmp_path):
+    path = tmp_path / "peer.sock"
+    config = policy(tmp_path, [])
+    config["proxy"].update({
+        "max_body_bytes": 64 * 1024 * 1024,
+        "max_response_bytes": 64 * 1024 * 1024,
+        "request_timeout_seconds": 300.0,
+        "upstream_timeout_seconds": 300.0,
+        "max_workers": 256,
+    })
+    srv = server.PeerProxyHTTPServer(str(path), config, FakeResolver())
+    try:
+        assert path.exists()
+    finally:
+        srv.server_close()
+        path.unlink()
+
+
 def test_serve_lifecycle_starts_and_cleans_peer_proxy(tmp_path, monkeypatch):
     config_path = tmp_path / "policy.json"
     control_path = tmp_path / "control.sock"

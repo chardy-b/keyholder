@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+from numbers import Real
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -76,6 +77,39 @@ class ForwardResponse:
 
 
 SUPPORTED_METHODS = frozenset({"DELETE", "GET", "PATCH", "POST", "PUT"})
+
+MAX_PROXY_BODY_BYTES = 64 * 1024 * 1024
+MAX_PROXY_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_PROXY_TIMEOUT_SECONDS = 300.0
+MAX_PROXY_WORKERS = 256
+
+
+def validate_proxy_resource_limits(
+    *, max_body_bytes: Any, max_response_bytes: Any,
+    request_timeout_seconds: Any, upstream_timeout_seconds: Any,
+    max_workers: Any,
+) -> tuple[int, int, float, float, int]:
+    """Validate limits before any server constructor can bind a socket."""
+    integer_limits = {
+        "max_body_bytes": (max_body_bytes, MAX_PROXY_BODY_BYTES),
+        "max_response_bytes": (max_response_bytes, MAX_PROXY_RESPONSE_BYTES),
+        "max_workers": (max_workers, MAX_PROXY_WORKERS),
+    }
+    for name, (value, upper) in integer_limits.items():
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= upper:
+            raise ProxyConfigurationError(f"{name} must be a positive integer no greater than {upper}")
+    float_limits = {
+        "request_timeout_seconds": request_timeout_seconds,
+        "upstream_timeout_seconds": upstream_timeout_seconds,
+    }
+    for name, value in float_limits.items():
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ProxyConfigurationError(f"{name} must be a finite number")
+        numeric = float(value)
+        if not math.isfinite(numeric) or not 0 < numeric <= MAX_PROXY_TIMEOUT_SECONDS:
+            raise ProxyConfigurationError(f"{name} must be positive and no greater than {MAX_PROXY_TIMEOUT_SECONDS:g}")
+    return (max_body_bytes, max_response_bytes, float(request_timeout_seconds),
+            float(upstream_timeout_seconds), max_workers)
 
 
 HOP_BY_HOP_HEADERS = {
@@ -620,19 +654,12 @@ class ProxyHTTPServer(ThreadingHTTPServer):
         request_timeout_seconds: float = 15,
         upstream_timeout_seconds: float = 30,
     ) -> None:
-        if (
-            not math.isfinite(request_timeout_seconds)
-            or not math.isfinite(upstream_timeout_seconds)
-            or min(
-                max_body_bytes,
-                max_response_bytes,
-                max_workers,
-                request_timeout_seconds,
-                upstream_timeout_seconds,
-            )
-            <= 0
-        ):
-            raise ProxyConfigurationError("proxy resource limits must be positive")
+        (max_body_bytes, max_response_bytes, request_timeout_seconds,
+         upstream_timeout_seconds, max_workers) = validate_proxy_resource_limits(
+            max_body_bytes=max_body_bytes, max_response_bytes=max_response_bytes,
+            request_timeout_seconds=request_timeout_seconds,
+            upstream_timeout_seconds=upstream_timeout_seconds, max_workers=max_workers,
+        )
         self.store = store
         self.audit_path = audit_path
         self.sender = sender
