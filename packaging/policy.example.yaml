@@ -17,6 +17,12 @@ proxy:
   enabled: true
   host: 127.0.0.1
   port: 8787
+  # Optional peer-credential OpenAI-compatible endpoint. It is disabled unless
+  # this absolute path is set. The parent directory must be root/keyholder
+  # owned and not group/world writable.
+  unix_socket_path: /run/keyholder/openrouter.sock
+  unix_socket_group: keyholder-clients
+  unix_socket_mode: "0o660"
   max_body_bytes: 8388608
   max_response_bytes: 8388608
   max_workers: 16
@@ -55,6 +61,7 @@ callers:
               profile: default
           - name: openrouter-chat-proxy
             provider: local_proxy
+            authentication: peercred
             ttl_seconds: 300
             max_ttl_seconds: 600
             upstream_base_url: https://openrouter.ai/api
@@ -64,3 +71,5 @@ callers:
               - POST
             allowed_routes:
               - /v1/chat/completions
+            allowed_models:
+              - stealth/ox-alpha

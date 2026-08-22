@@ -42,7 +42,7 @@ Deployable and tested end-to-end today for GitHub App tokens (read and write). A
 | ------------- | ------------------------------------------------------- | ----------------------------- |
 | `github_app`  | GitHub App installation access tokens (via JWT)         | Tested end-to-end             |
 | `aws_sts`     | AWS session credentials (`AKIA…` + session token)       | Implemented, awaiting smoke test |
-| `local_proxy` | Opaque capabilities for route-bound HTTP forwarding    | Buffered forwarding operational |
+| `local_proxy` | Opaque capabilities or peercred UDS forwarding         | Buffered forwarding operational |
 | `fake`        | Deterministic fake credential for tests                 | Test-only                     |
 
 Adding a new provider means writing a class with a single `issue(grant, secrets, ttl) -> IssuedCredential` method — see [`src/keyholderd/providers/base.py`](src/keyholderd/providers/base.py).
@@ -202,6 +202,11 @@ proxy:
   max_workers: 16
   request_timeout_seconds: 15
   upstream_timeout_seconds: 30
+  # Optional: enables the peer-credential OpenAI endpoint. No upstream key
+  # belongs in Hermes; this reference is resolved only inside keyholderd.
+  unix_socket_path: /run/keyholder/openrouter.sock
+  unix_socket_group: keyholder-clients
+  unix_socket_mode: "0o660"
 
 callers:
   hermes:
@@ -233,6 +238,7 @@ callers:
 
           - name: openrouter-chat-proxy
             provider: local_proxy
+            authentication: peercred
             ttl_seconds: 300
             max_ttl_seconds: 600
             upstream_base_url: https://openrouter.ai/api
@@ -240,6 +246,7 @@ callers:
               upstream_api_key: "key:openrouter"
             allowed_methods: [POST]
             allowed_routes: [/v1/chat/completions]
+            allowed_models: [stealth/ox-alpha]
 ```
 
 Bitwarden references in policy examples must use either a canonical UUID string
@@ -248,6 +255,31 @@ configured Bitwarden project. These examples use placeholders only; never put
 a real secret ID or secret value in tracked documentation.
 
 See [`packaging/policy.example.yaml`](packaging/policy.example.yaml) for a fuller starter policy.
+
+The optional `proxy.unix_socket_path` exposes an OpenAI-compatible endpoint
+over a Unix socket authenticated with Linux `SO_PEERCRED`; it has no bearer
+authentication. Set `unix_socket_group` to the dedicated client group and use
+`unix_socket_mode: "0o660"` (or `"0o600"` when no group access is needed).
+The daemon owns the socket and removes/recreates it during its lifecycle.
+It fails closed on unsafe parents, non-socket stale paths, unsafe modes, or
+missing/ambiguous peer grants. The peer grant must explicitly use
+`authentication: peercred`, POST `/v1/chat/completions`, and
+`allowed_models: [stealth/ox-alpha]`; its Bitwarden reference is the only
+location for the upstream key, which is never placed in Hermes.
+
+This endpoint is opt-in and is enabled only when `unix_socket_path` is set.
+Validate with `keyholder doctor`, `systemctl is-active`, and `stat` on the
+socket—never by issuing a capability or sending a real upstream request.
+Restart after policy changes. Audit events and daemon logs expose request,
+latency, completion, rejection, and failure signals without credentials;
+ship them to journald/Loki as described in
+[`docs/grafana-logging.md`](docs/grafana-logging.md). Remove the grant or
+unset `unix_socket_path`, then restart, to revoke/roll back access. Existing
+in-memory state fails closed across restart.
+
+**Hermes limitation:** the Hermes gateway needs a UDS-capable OpenAI client
+adapter before it can consume this endpoint. Until then, use a UDS-capable
+local client for validation; do not place an upstream key in Hermes.
 
 The daemon loads policy at startup only. Restart the service (`sudo systemctl restart keyholder.service`) after editing.
 

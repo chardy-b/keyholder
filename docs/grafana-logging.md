@@ -28,6 +28,14 @@ loki.process "keyholder" {
 
 Audit events are append-only JSONL at `/var/log/keyholder/audit.jsonl`; configure a separate file target if you want searchable audit records. Secret-like fields are rejected before writes, and provider token values are never sent to the audit log.
 
+For the peer-credential OpenRouter socket, monitor `proxy_attempt`, successful
+completion, rejection, and failure events together with daemon request/latency
+logs. These are operational signals only: caller identity, grant, route,
+status, and timing may be recorded, but capabilities, model payloads, and
+upstream keys must not appear. A missing socket, permission failure, or daemon
+restart should be treated as fail-closed availability rather than a reason to
+fall back to copying an upstream key into Hermes.
+
 Suggested Loki queries:
 
 ```logql
