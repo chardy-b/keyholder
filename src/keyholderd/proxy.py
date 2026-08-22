@@ -56,6 +56,8 @@ class ProxyCapability:
     upstream_api_key: str
     allowed_methods: frozenset[str]
     allowed_routes: frozenset[str]
+    authentication: str
+    allowed_models: frozenset[str] | None
     expires_at: datetime
 
 
@@ -90,9 +92,20 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
+def validate_peercred_chat_body(body: bytes, allowed_models: frozenset[str] | list[str]) -> None:
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProxyRequestError("request body must be valid JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+        raise ProxyRequestError("request body must contain a string model")
+    if payload["model"] not in allowed_models:
+        raise ProxyRequestError("model is not allowed")
+
+
 def validated_proxy_grant(
     grant: dict[str, Any], secrets: dict[str, str]
-) -> tuple[str, frozenset[str], frozenset[str]]:
+) -> tuple[str, frozenset[str], frozenset[str], str, frozenset[str] | None]:
     try:
         upstream_base_url = str(grant["upstream_base_url"])
         upstream_api_key = secrets["upstream_api_key"]
@@ -142,7 +155,20 @@ def validated_proxy_grant(
     methods = frozenset(method.upper() for method in raw_methods)
     if not methods.issubset(SUPPORTED_METHODS):
         raise ProxyConfigurationError("allowed_methods contains an unsupported method")
-    return upstream_base_url, methods, routes
+    authentication = grant.get("authentication", "capability")
+    if authentication not in {"capability", "peercred"}:
+        raise ProxyConfigurationError("authentication must be capability or peercred")
+    allowed_models: frozenset[str] | None = None
+    if authentication == "peercred":
+        raw_models = grant.get("allowed_models")
+        if (
+            not isinstance(raw_models, list)
+            or not raw_models
+            or not all(isinstance(model, str) and model for model in raw_models)
+        ):
+            raise ProxyConfigurationError("allowed_models must be a non-empty string array")
+        allowed_models = frozenset(raw_models)
+    return upstream_base_url, methods, routes, authentication, allowed_models
 
 
 def validated_content_length(
@@ -216,7 +242,7 @@ class CapabilityStore:
         profile: str = "",
         grant_name: str = "",
     ) -> None:
-        upstream_base_url, methods, routes = validated_proxy_grant(grant, secrets)
+        upstream_base_url, methods, routes, authentication, allowed_models = validated_proxy_grant(grant, secrets)
         capability = ProxyCapability(
             lease_id=lease_id,
             caller=caller,
@@ -226,6 +252,8 @@ class CapabilityStore:
             upstream_api_key=secrets["upstream_api_key"],
             allowed_methods=methods,
             allowed_routes=routes,
+            authentication=authentication,
+            allowed_models=allowed_models,
             expires_at=expires_at,
         )
         with self._lock:
@@ -495,6 +523,11 @@ def forward_request(
         }
         if audit_path is not None:
             write_audit_event(audit_path, {"event": "proxy_attempt", **audit_base})
+        if capability.authentication == "peercred":
+            # Peer-credential grants are renewable, so the model boundary is
+            # enforced on every request rather than by a short-lived token.
+            assert capability.allowed_models is not None
+            validate_peercred_chat_body(body, capability.allowed_models)
         upstream_headers = _forward_headers(headers)
         upstream_headers["Authorization"] = f"Bearer {capability.upstream_api_key}"
         try:
