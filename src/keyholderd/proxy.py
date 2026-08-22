@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+from numbers import Real
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -56,6 +57,8 @@ class ProxyCapability:
     upstream_api_key: str
     allowed_methods: frozenset[str]
     allowed_routes: frozenset[str]
+    authentication: str
+    allowed_models: frozenset[str] | None
     expires_at: datetime
 
 
@@ -75,6 +78,39 @@ class ForwardResponse:
 
 SUPPORTED_METHODS = frozenset({"DELETE", "GET", "PATCH", "POST", "PUT"})
 
+MAX_PROXY_BODY_BYTES = 64 * 1024 * 1024
+MAX_PROXY_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_PROXY_TIMEOUT_SECONDS = 300.0
+MAX_PROXY_WORKERS = 256
+
+
+def validate_proxy_resource_limits(
+    *, max_body_bytes: Any, max_response_bytes: Any,
+    request_timeout_seconds: Any, upstream_timeout_seconds: Any,
+    max_workers: Any,
+) -> tuple[int, int, float, float, int]:
+    """Validate limits before any server constructor can bind a socket."""
+    integer_limits = {
+        "max_body_bytes": (max_body_bytes, MAX_PROXY_BODY_BYTES),
+        "max_response_bytes": (max_response_bytes, MAX_PROXY_RESPONSE_BYTES),
+        "max_workers": (max_workers, MAX_PROXY_WORKERS),
+    }
+    for name, (value, upper) in integer_limits.items():
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= upper:
+            raise ProxyConfigurationError(f"{name} must be a positive integer no greater than {upper}")
+    float_limits = {
+        "request_timeout_seconds": request_timeout_seconds,
+        "upstream_timeout_seconds": upstream_timeout_seconds,
+    }
+    for name, value in float_limits.items():
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ProxyConfigurationError(f"{name} must be a finite number")
+        numeric = float(value)
+        if not math.isfinite(numeric) or not 0 < numeric <= MAX_PROXY_TIMEOUT_SECONDS:
+            raise ProxyConfigurationError(f"{name} must be positive and no greater than {MAX_PROXY_TIMEOUT_SECONDS:g}")
+    return (max_body_bytes, max_response_bytes, float(request_timeout_seconds),
+            float(upstream_timeout_seconds), max_workers)
+
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -90,9 +126,20 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
+def validate_peercred_chat_body(body: bytes, allowed_models: frozenset[str] | list[str]) -> None:
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProxyRequestError("request body must be valid JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+        raise ProxyRequestError("request body must contain a string model")
+    if payload["model"] not in allowed_models:
+        raise ProxyRequestError("model is not allowed")
+
+
 def validated_proxy_grant(
     grant: dict[str, Any], secrets: dict[str, str]
-) -> tuple[str, frozenset[str], frozenset[str]]:
+) -> tuple[str, frozenset[str], frozenset[str], str, frozenset[str] | None]:
     try:
         upstream_base_url = str(grant["upstream_base_url"])
         upstream_api_key = secrets["upstream_api_key"]
@@ -142,7 +189,20 @@ def validated_proxy_grant(
     methods = frozenset(method.upper() for method in raw_methods)
     if not methods.issubset(SUPPORTED_METHODS):
         raise ProxyConfigurationError("allowed_methods contains an unsupported method")
-    return upstream_base_url, methods, routes
+    authentication = grant.get("authentication", "capability")
+    if authentication not in {"capability", "peercred"}:
+        raise ProxyConfigurationError("authentication must be capability or peercred")
+    allowed_models: frozenset[str] | None = None
+    if authentication == "peercred":
+        raw_models = grant.get("allowed_models")
+        if (
+            not isinstance(raw_models, list)
+            or not raw_models
+            or not all(isinstance(model, str) and model for model in raw_models)
+        ):
+            raise ProxyConfigurationError("allowed_models must be a non-empty string array")
+        allowed_models = frozenset(raw_models)
+    return upstream_base_url, methods, routes, authentication, allowed_models
 
 
 def validated_content_length(
@@ -216,7 +276,7 @@ class CapabilityStore:
         profile: str = "",
         grant_name: str = "",
     ) -> None:
-        upstream_base_url, methods, routes = validated_proxy_grant(grant, secrets)
+        upstream_base_url, methods, routes, authentication, allowed_models = validated_proxy_grant(grant, secrets)
         capability = ProxyCapability(
             lease_id=lease_id,
             caller=caller,
@@ -226,6 +286,8 @@ class CapabilityStore:
             upstream_api_key=secrets["upstream_api_key"],
             allowed_methods=methods,
             allowed_routes=routes,
+            authentication=authentication,
+            allowed_models=allowed_models,
             expires_at=expires_at,
         )
         with self._lock:
@@ -495,6 +557,24 @@ def forward_request(
         }
         if audit_path is not None:
             write_audit_event(audit_path, {"event": "proxy_attempt", **audit_base})
+        if capability.authentication == "peercred":
+            # Peer-credential grants are renewable, so the model boundary is
+            # enforced on every request rather than by a short-lived token.
+            assert capability.allowed_models is not None
+            try:
+                validate_peercred_chat_body(body, capability.allowed_models)
+            except ProxyRequestError as exc:
+                if audit_path is not None:
+                    write_audit_event(
+                        audit_path,
+                        {"event": "proxy_rejected", **audit_base, "failure_type": "model_validation"},
+                    )
+                # The HTTP handler must not emit a second terminal rejection.
+                try:
+                    setattr(exc, "_keyholder_rejection_audited", True)
+                except (AttributeError, TypeError):
+                    pass
+                raise
         upstream_headers = _forward_headers(headers)
         upstream_headers["Authorization"] = f"Bearer {capability.upstream_api_key}"
         try:
@@ -574,19 +654,12 @@ class ProxyHTTPServer(ThreadingHTTPServer):
         request_timeout_seconds: float = 15,
         upstream_timeout_seconds: float = 30,
     ) -> None:
-        if (
-            not math.isfinite(request_timeout_seconds)
-            or not math.isfinite(upstream_timeout_seconds)
-            or min(
-                max_body_bytes,
-                max_response_bytes,
-                max_workers,
-                request_timeout_seconds,
-                upstream_timeout_seconds,
-            )
-            <= 0
-        ):
-            raise ProxyConfigurationError("proxy resource limits must be positive")
+        (max_body_bytes, max_response_bytes, request_timeout_seconds,
+         upstream_timeout_seconds, max_workers) = validate_proxy_resource_limits(
+            max_body_bytes=max_body_bytes, max_response_bytes=max_response_bytes,
+            request_timeout_seconds=request_timeout_seconds,
+            upstream_timeout_seconds=upstream_timeout_seconds, max_workers=max_workers,
+        )
         self.store = store
         self.audit_path = audit_path
         self.sender = sender
@@ -747,7 +820,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             status = 401 if str(exc) in {"bearer capability is required", "invalid capability"} else 403
             self._error(status, str(exc))
         except ProxyRequestError as exc:
-            self._audit_rejection("proxy_rejected", type(exc).__name__)
+            if not getattr(exc, "_keyholder_rejection_audited", False):
+                self._audit_rejection("proxy_rejected", type(exc).__name__)
             self._error(exc.status, str(exc))
         except (requests.RequestException, ProxyUpstreamError, OSError, ValueError) as exc:
             if not getattr(exc, "_keyholder_audited", False):

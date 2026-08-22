@@ -10,6 +10,9 @@ import socketserver
 import subprocess
 import grp
 import threading
+import stat
+import secrets
+import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -18,7 +21,8 @@ from .audit import write_audit_event
 from .bitwarden import BwsResolver
 from .leases import LeaseStore
 from .peercred import get_peercred, uid_to_name
-from .policy import PolicyError, get_grant, grants_for_caller, load_policy, validate_ttl
+from .policy import PolicyError, get_grant, get_peercred_proxy_grant, grants_for_caller, load_policy, validate_ttl
+from .proxy import ProxyRequestError, ProxyAuthorizationError, forward_request, validated_proxy_grant, validated_content_length, read_exact_body, validated_header_items, validate_proxy_resource_limits
 from .providers.aws_sts import AwsStsProvider
 from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
@@ -150,12 +154,154 @@ def create_proxy_server(config: dict[str, Any]) -> ProxyHTTPServer:
         (host, int(proxy_config.get("port", 8787))),
         store=provider.store,
         audit_path=audit_path,
-        max_body_bytes=int(proxy_config.get("max_body_bytes", 8 * 1024 * 1024)),
-        max_response_bytes=int(proxy_config.get("max_response_bytes", 8 * 1024 * 1024)),
-        max_workers=int(proxy_config.get("max_workers", 16)),
-        request_timeout_seconds=float(proxy_config.get("request_timeout_seconds", 15)),
-        upstream_timeout_seconds=float(proxy_config.get("upstream_timeout_seconds", 30)),
+        max_body_bytes=proxy_config.get("max_body_bytes", 8 * 1024 * 1024),
+        max_response_bytes=proxy_config.get("max_response_bytes", 8 * 1024 * 1024),
+        max_workers=proxy_config.get("max_workers", 16),
+        request_timeout_seconds=proxy_config.get("request_timeout_seconds", 15),
+        upstream_timeout_seconds=proxy_config.get("upstream_timeout_seconds", 30),
     )
+
+
+def validate_unix_socket_mode(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ServerError("unix_socket_mode must be an octal mode", 500)
+    if isinstance(value, int):
+        mode = value
+    elif isinstance(value, str) and (re.fullmatch(r"0o[0-7]{3}", value) or re.fullmatch(r"0[0-7]{3}", value)):
+        mode = int(value, 8)
+    else:
+        raise ServerError("unix_socket_mode must be a canonical octal mode", 500)
+    if mode & ~0o660 or mode & 0o600 != 0o600:
+        raise ServerError("unix_socket_mode must provide owner read/write and no unsafe bits", 500)
+    return mode
+
+
+def _socket_parent(path: str) -> tuple[int, str]:
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    if not path or not os.path.isabs(path) or not name or name in {".", ".."} or "/" in name or ".." in path.split(os.sep):
+        raise ServerError("proxy unix socket path must be absolute and contain no traversal", 500)
+    info = os.lstat(parent)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ServerError("proxy unix socket parent must be a real directory", 500)
+    if info.st_uid not in {os.geteuid(), 0} or info.st_mode & 0o022:
+        raise ServerError("proxy unix socket parent is unsafe", 500)
+    return os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)), name
+
+
+def validate_peer_proxy_socket_path(path: str) -> None:
+    fd, name = _socket_parent(path)
+    try:
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(info.st_mode):
+            raise ServerError("proxy unix socket path is not a socket", 500)
+    finally:
+        os.close(fd)
+
+
+class PeerProxyHTTPServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    def __init__(self, socket_path: str, config: dict[str, Any], resolver: BwsResolver):
+        validate_peer_proxy_socket_path(socket_path)
+        self.config, self.resolver = config, resolver
+        proxy_config = config.get("proxy", {})
+        limits = validate_proxy_resource_limits(
+            max_body_bytes=proxy_config.get("max_body_bytes", 8 * 1024 * 1024),
+            max_response_bytes=proxy_config.get("max_response_bytes", 8 * 1024 * 1024),
+            request_timeout_seconds=proxy_config.get("request_timeout_seconds", 15),
+            upstream_timeout_seconds=proxy_config.get("upstream_timeout_seconds", 30),
+            max_workers=proxy_config.get("max_workers", 16),
+        )
+        parent_fd, socket_name = _socket_parent(socket_path)
+        try:
+            try:
+                os.unlink(socket_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(parent_fd)
+        self.request_timeout_seconds = limits[2]
+        self.max_workers = limits[4]
+        self._worker_slots = threading.BoundedSemaphore(self.max_workers)
+        socket_mode = validate_unix_socket_mode(proxy_config.get("unix_socket_mode", "0o660"))
+        super().__init__(socket_path, PeerProxyHandler)
+        group = proxy_config.get("unix_socket_group")
+        if group:
+            os.chown(socket_path, -1, grp.getgrnam(str(group)).gr_gid)
+        os.chmod(socket_path, socket_mode, follow_symlinks=False)
+
+    def get_request(self) -> tuple[Any, Any]:
+        request, address = super().get_request()
+        request.settimeout(self.request_timeout_seconds)
+        return request, address
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        self._worker_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
+
+
+class PeerProxyHandler(BaseHTTPRequestHandler):
+    server: PeerProxyHTTPServer
+    def log_message(self, format: str, *args: Any) -> None: LOG.info(format, *args)
+    def _send(self, status: int, payload: bytes) -> None:
+        self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+    def _handle(self) -> None:
+        audited_rejection = False
+        try:
+            if self.request_version != "HTTP/1.1" or not self.path.startswith("/"):
+                raise ProxyRequestError("origin-form HTTP/1.1 is required")
+            headers = validated_header_items(list(self.headers.raw_items()))
+            if any(name.lower() == "authorization" for name in headers):
+                raise ProxyAuthorizationError("Authorization header is not accepted")
+            _pid, uid, _gid = get_peercred(self.connection)  # type: ignore[arg-type]
+            caller = uid_to_name(uid)
+            grant = get_peercred_proxy_grant(self.server.config, caller, "default")
+            secrets_map = self.server.resolver.resolve_refs(grant.get("bitwarden_refs", {}))
+            validated_proxy_grant(grant, secrets_map)
+            raw = list(self.headers.raw_items())
+            proxy_config = self.server.config.get("proxy", {})
+            length = validated_content_length(
+                [v for n, v in raw if n.lower() == "content-length"],
+                transfer_encoding=next((v for n, v in raw if n.lower() == "transfer-encoding"), None),
+                max_body_bytes=int(proxy_config.get("max_body_bytes", 8 * 1024 * 1024)),
+            )
+            body = read_exact_body(self.rfile, length)
+            provider = PROVIDERS["local_proxy"]
+            assert isinstance(provider, LocalProxyProvider)
+            from datetime import UTC, datetime, timedelta
+            token = "_peercred_internal_" + secrets.token_urlsafe(32)
+            lease_id = "peercred-request-" + secrets.token_urlsafe(32)
+            provider.store.register(token=token, lease_id=lease_id, grant=grant, secrets=secrets_map, expires_at=datetime.now(UTC)+timedelta(seconds=float(proxy_config.get("request_timeout_seconds", 15))), caller=caller, grant_name=str(grant.get("name", "")))
+            try:
+                result = forward_request(provider.store, token=token, method=self.command, target=self.path, headers=headers, body=body, max_response_bytes=int(proxy_config.get("max_response_bytes", 8 * 1024 * 1024)), upstream_timeout_seconds=float(proxy_config.get("upstream_timeout_seconds", 30)), audit_path=_audit_paths(self.server.config)[1])
+            finally:
+                provider.store.revoke_lease(lease_id)
+            self._send(result.status, result.body)
+        except (PolicyError, ProxyAuthorizationError, ProxyRequestError) as exc:
+            audited_rejection = bool(getattr(exc, "_keyholder_rejection_audited", False))
+            if not audited_rejection:
+                write_audit_event(_audit_paths(self.server.config)[1], {"event":"proxy_rejected", "caller":"unknown", "profile":"default", "grant":"", "provider":"local_proxy", "ttl_seconds":0, "lease_id":"", "reason":"peer proxy request rejected", "method":self.command, "route":"", "failure_type":type(exc).__name__})
+            self._send(getattr(exc, "status", 403), json.dumps({"error": str(exc)}).encode())
+        except Exception:
+            LOG.exception("peer proxy request failed")
+            self._send(500, b'{"error":"proxy request failed"}')
+    do_POST = _handle
+    do_GET = _handle
+    do_PUT = _handle
+    do_PATCH = _handle
+    do_DELETE = _handle
 
 
 class KeyholderHandler(BaseHTTPRequestHandler):
@@ -202,6 +348,13 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None) -
     config = load_policy(config_path)
     proxy_server = create_proxy_server(config) if proxy_listener_enabled(config) else None
     proxy_thread = None
+    peer_proxy = None
+    peer_thread = None
+    unix_proxy_path = config.get("proxy", {}).get("unix_socket_path")
+    if unix_proxy_path:
+        peer_proxy = PeerProxyHTTPServer(str(unix_proxy_path), config, _resolver(config))
+        peer_thread = threading.Thread(target=peer_proxy.serve_forever, name="keyholder-peer-proxy", daemon=True)
+        peer_thread.start()
     if proxy_server is not None:
         proxy_thread = threading.Thread(target=proxy_server.serve_forever, name="keyholder-proxy", daemon=True)
         proxy_thread.start()
@@ -220,6 +373,19 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None) -
                 )
             server.serve_forever()
     finally:
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+        if peer_proxy is not None:
+            peer_proxy.shutdown()
+            peer_proxy.server_close()
+            if peer_thread is not None:
+                peer_thread.join(timeout=5)
+            try:
+                os.unlink(str(unix_proxy_path))
+            except FileNotFoundError:
+                pass
         if proxy_server is not None:
             proxy_server.shutdown()
             proxy_server.server_close()

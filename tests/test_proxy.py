@@ -25,6 +25,7 @@ from keyholderd.proxy import (
     read_exact_body,
     validated_content_length,
     validated_header_items,
+    validate_peercred_chat_body,
 )
 
 
@@ -49,6 +50,128 @@ def test_capability_authorizes_configured_method_and_route():
     assert capability.upstream_base_url == "https://api.example.test"
     assert capability.upstream_api_key == "real-secret"
     assert capability.expires_at == expires_at
+
+
+@pytest.mark.parametrize("body", [b"{}", b'{"model": 1}', b'{"model": "other"}'])
+def test_peercred_chat_body_rejects_missing_non_string_or_disallowed_model(body):
+    with pytest.raises(ProxyRequestError, match="model"):
+        validate_peercred_chat_body(body, ["stealth/ox-alpha"])
+
+
+def test_peercred_chat_body_permits_exactly_configured_model():
+    validate_peercred_chat_body(
+        b'{"model":"stealth/ox-alpha","messages":[]}',
+        ["stealth/ox-alpha"],
+    )
+
+
+@pytest.mark.parametrize("allowed_models", [None, [], "stealth/ox-alpha", ["stealth/ox-alpha", 1]])
+def test_peercred_grant_requires_non_empty_string_model_allowlist(allowed_models):
+    grant = {
+        "authentication": "peercred",
+        "upstream_base_url": "https://api.example.test",
+        "allowed_routes": ["/v1/chat/completions"],
+        "allowed_models": allowed_models,
+    }
+    with pytest.raises(ProxyConfigurationError, match="allowed_models"):
+        CapabilityStore().register(
+            token="khcap_peercred_bad_models",
+            lease_id="lease_peercred_bad_models",
+            grant=grant,
+            secrets={"upstream_api_key": "real-secret"},
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+
+
+def test_peercred_grant_rejects_disallowed_model_before_forwarding():
+    store = CapabilityStore()
+    store.register(
+        token="khcap_peercred_forward",
+        lease_id="lease_peercred_forward",
+        grant={
+            "authentication": "peercred",
+            "upstream_base_url": "https://api.example.test",
+            "allowed_routes": ["/v1/chat/completions"],
+            "allowed_models": ["stealth/ox-alpha"],
+        },
+        secrets={"upstream_api_key": "real-secret"},
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    sender_called = False
+
+    def sender(**kwargs):
+        nonlocal sender_called
+        sender_called = True
+        return None
+
+    with pytest.raises(ProxyRequestError, match="model"):
+        forward_request(
+            store,
+            token="khcap_peercred_forward",
+            method="POST",
+            target="/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            body=b'{"model":"other"}',
+            sender=sender,
+        )
+    assert sender_called is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"model":"stealth/ox-alpha",',
+        b'{"messages":[],"credential":"credential-secret","capability":"capability-secret"}',
+        b'{"model":123,"credential":"credential-secret","capability":"capability-secret"}',
+        b'{"model":"other-model","credential":"credential-secret","capability":"capability-secret"}',
+    ],
+)
+def test_peercred_model_rejection_audits_once_after_attempt_without_sensitive_values(tmp_path, body):
+    store = CapabilityStore()
+    store.register(
+        token="khcap_peercred_audit",
+        lease_id="lease_peercred_audit",
+        grant={
+            "authentication": "peercred",
+            "upstream_base_url": "https://api.example.test",
+            "allowed_routes": ["/v1/chat/completions"],
+            "allowed_models": ["stealth/ox-alpha"],
+        },
+        secrets={"upstream_api_key": "credential-secret"},
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    audit_path = str(tmp_path / "audit.jsonl")
+
+    with pytest.raises(ProxyRequestError):
+        forward_request(
+            store,
+            token="khcap_peercred_audit",
+            method="POST",
+            target="/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            body=body,
+            sender=lambda **kwargs: pytest.fail("rejected request was forwarded"),
+            audit_path=audit_path,
+        )
+
+    events = [json.loads(line) for line in open(audit_path, encoding="utf-8")]
+    assert [event["event"] for event in events] == ["proxy_attempt", "proxy_rejected"]
+    rejection_line = open(audit_path, encoding="utf-8").read().splitlines()[1]
+    for sensitive in ("stealth/ox-alpha", "other-model", "credential-secret", "capability-secret"):
+        assert sensitive not in rejection_line
+
+
+def test_existing_capability_grant_does_not_require_model_allowlist():
+    CapabilityStore().register(
+        token="khcap_existing",
+        lease_id="lease_existing",
+        grant={
+            "upstream_base_url": "https://api.example.test",
+            "allowed_routes": ["/v1/chat/completions"],
+        },
+        secrets={"upstream_api_key": "real-secret"},
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
 
 
 def test_unknown_capability_is_rejected():
@@ -846,6 +969,55 @@ def test_proxy_http_server_forwards_authorized_request_and_audits(tmp_path):
     assert audit_events[0]["route"] == "/v1/chat/completions"
     assert "real-secret" not in audit_path.read_text()
     assert "khcap_http" not in audit_path.read_text()
+
+
+def test_proxy_http_server_audits_peercred_model_rejection_once(tmp_path):
+    store = CapabilityStore()
+    store.register(
+        token="khcap_peercred_http",
+        lease_id="lease_peercred_http",
+        grant={
+            "authentication": "peercred",
+            "upstream_base_url": "https://api.example.test",
+            "allowed_routes": ["/v1/chat/completions"],
+            "allowed_models": ["stealth/ox-alpha"],
+        },
+        secrets={"upstream_api_key": "credential-secret"},
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    proxy_server = ProxyHTTPServer(
+        ("127.0.0.1", 0), store=store, audit_path=str(audit_path)
+    )
+    thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", proxy_server.server_address[1], timeout=5
+        )
+        connection.request(
+            "POST", "/v1/chat/completions",
+            body=b'{"model":"other-model","credential":"credential-secret"}',
+            headers={
+                "Authorization": "Bearer khcap_peercred_http",
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+    finally:
+        proxy_server.shutdown()
+        proxy_server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 400
+    audit_text = audit_path.read_text()
+    events = [json.loads(line) for line in audit_text.splitlines()]
+    assert [event["event"] for event in events] == ["proxy_attempt", "proxy_rejected"]
+    assert all(value not in audit_text for value in (
+        "other-model", "credential-secret", "khcap_peercred_http",
+    ))
 
 
 def test_proxy_http_server_audits_denied_request(tmp_path):

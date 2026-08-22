@@ -10,3 +10,6 @@ packaging/policy.local.yaml
 # Build artifacts
 /dist/
 /packaging/staging/
+
+# Local delegated-work execution records
+/.hermes/execution/
