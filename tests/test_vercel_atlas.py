@@ -16,6 +16,7 @@ from keyholderd.proxy import (
     ProxyHTTPServer,
     ProxyRequestError,
     ProxyUpstreamError,
+    _bind_vercel_project_id,
     _normalize_vercel_response,
     _vercel_operation,
     forward_request,
@@ -176,7 +177,16 @@ def test_response_normalization_is_operation_and_resource_bound() -> None:
 
 
 def test_domain_and_deployment_responses_are_bounded_and_normalized() -> None:
-    add = operation({"operation": "add_domain", "project_name": "atlas-x", "domain": "x.chezchardin.com"})
+    add = _bind_vercel_project_id(
+        operation(
+            {
+                "operation": "add_domain",
+                "project_name": "atlas-x",
+                "domain": "x.chezchardin.com",
+            }
+        ),
+        "prj_1",
+    )
     assert json.loads(
         _normalize_vercel_response(
             add,
@@ -192,8 +202,9 @@ def test_domain_and_deployment_responses_are_bounded_and_normalized() -> None:
             add, ForwardResponse(200, {}, b'{"name":"evil.example"}')
         )
 
-    domains = operation(
-        {"operation": "list_domains", "project_name": "atlas-x"}
+    domains = _bind_vercel_project_id(
+        operation({"operation": "list_domains", "project_name": "atlas-x"}),
+        "prj_1",
     )
     assert json.loads(
         _normalize_vercel_response(
@@ -210,8 +221,9 @@ def test_domain_and_deployment_responses_are_bounded_and_normalized() -> None:
         ]
     }
 
-    deployments = operation(
-        {"operation": "list_deployments", "project_name": "atlas-x"}
+    deployments = _bind_vercel_project_id(
+        operation({"operation": "list_deployments", "project_name": "atlas-x"}),
+        "prj_1",
     )
     raw = b'{"deployments":[{"uid":"dpl_1","name":"atlas-x","projectId":"prj_1","url":"atlas-x.vercel.app","readyState":"READY","meta":{"secret":"drop"}}]}'
     assert json.loads(
@@ -227,6 +239,55 @@ def test_domain_and_deployment_responses_are_bounded_and_normalized() -> None:
             }
         ]
     }
+
+
+def test_domain_and_deployment_responses_reject_foreign_resources() -> None:
+    domain_operation = _bind_vercel_project_id(
+        operation({"operation": "list_domains", "project_name": "atlas-x"}),
+        "prj_expected",
+    )
+    for body in (
+        b'{"domains":[{"name":"evil.example","projectId":"prj_expected","verified":true}]}',
+        b'{"domains":[{"name":"x.chezchardin.com","projectId":"prj_foreign","verified":true}]}',
+    ):
+        with pytest.raises(ProxyUpstreamError):
+            _normalize_vercel_response(
+                domain_operation, ForwardResponse(200, {}, body)
+            )
+
+    deployment_operation = _bind_vercel_project_id(
+        operation({"operation": "list_deployments", "project_name": "atlas-x"}),
+        "prj_expected",
+    )
+    with pytest.raises(ProxyUpstreamError):
+        _normalize_vercel_response(
+            deployment_operation,
+            ForwardResponse(
+                200,
+                {},
+                b'{"deployments":[{"uid":"dpl_1","name":"atlas-x","projectId":"prj_foreign","url":"atlas-x.vercel.app","readyState":"READY"}]}',
+            ),
+        )
+
+    add_operation = _bind_vercel_project_id(
+        operation(
+            {
+                "operation": "add_domain",
+                "project_name": "atlas-x",
+                "domain": "x.chezchardin.com",
+            }
+        ),
+        "prj_expected",
+    )
+    with pytest.raises(ProxyUpstreamError):
+        _normalize_vercel_response(
+            add_operation,
+            ForwardResponse(
+                200,
+                {},
+                b'{"name":"x.chezchardin.com","projectId":"prj_foreign","verified":false}',
+            ),
+        )
 
 
 def test_malformed_success_and_non_success_are_sanitized() -> None:
@@ -274,6 +335,55 @@ def test_invalid_vercel_profile_fails_before_secret_resolution(
             {"grant": "vercel-atlas-control", "reason": "validation test"},
         )
     assert not (tmp_path / "leases.db").exists()
+
+
+def test_domain_operation_preflights_exact_project_and_binds_response_id() -> None:
+    store = registered_store()
+    observed_urls: list[str] = []
+    response_bodies = iter(
+        [
+            b'{"projects":[{"id":"prj_exact","name":"atlas-x"}]}',
+            b'{"domains":[{"name":"x.chezchardin.com","projectId":"prj_exact","verified":true}]}',
+        ]
+    )
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self) -> None:
+            self.content = next(response_bodies)
+
+        def close(self) -> None:
+            pass
+
+    def sender(**kwargs):
+        observed_urls.append(kwargs["url"])
+        return Response()
+
+    response = forward_request(
+        store=store,
+        token="khcap_vercel",
+        method="POST",
+        target="/v1/vercel",
+        headers={"Content-Type": "application/json"},
+        body=b'{"operation":"list_domains","project_name":"atlas-x"}',
+        sender=sender,
+    )
+
+    assert observed_urls == [
+        "https://api.vercel.com/v10/projects?search=atlas-x",
+        "https://api.vercel.com/v9/projects/prj_exact/domains",
+    ]
+    assert json.loads(response.body) == {
+        "domains": [
+            {
+                "name": "x.chezchardin.com",
+                "project_id": "prj_exact",
+                "verified": True,
+            }
+        ]
+    }
 
 
 def test_public_issue_proxy_and_revoke_flow_is_bounded_and_audited(
