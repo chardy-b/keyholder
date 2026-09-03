@@ -53,6 +53,12 @@ callers:
             session_tags:
               app: hermes
               profile: default
+          - name: vercel-atlas-control
+            provider: vercel_control
+            ttl_seconds: 300
+            max_ttl_seconds: 600
+            bitwarden_refs:
+              vercel_api_token: "<placeholder-only: BWS secret ref>"
           - name: openrouter-chat-proxy
             provider: local_proxy
             ttl_seconds: 300
@@ -64,3 +70,4 @@ callers:
               - POST
             allowed_routes:
               - /v1/chat/completions
+
