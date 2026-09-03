@@ -259,15 +259,15 @@ def test_domain_and_deployment_responses_reject_foreign_resources() -> None:
         operation({"operation": "list_deployments", "project_name": "atlas-x"}),
         "prj_expected",
     )
-    with pytest.raises(ProxyUpstreamError):
-        _normalize_vercel_response(
-            deployment_operation,
-            ForwardResponse(
-                200,
-                {},
-                b'{"deployments":[{"uid":"dpl_1","name":"atlas-x","projectId":"prj_foreign","url":"atlas-x.vercel.app","readyState":"READY"}]}',
-            ),
-        )
+    for body in (
+        b'{"deployments":[{"uid":"dpl_1","name":"atlas-x","projectId":"prj_foreign","url":"atlas-x.vercel.app","readyState":"READY"}]}',
+        b'{"deployments":[{"uid":"dpl_1","name":"atlas-x","projectId":"prj_expected","url":"atlas-x-.vercel.app","readyState":"READY"}]}',
+    ):
+        with pytest.raises(ProxyUpstreamError):
+            _normalize_vercel_response(
+                deployment_operation,
+                ForwardResponse(200, {}, body),
+            )
 
     add_operation = _bind_vercel_project_id(
         operation(

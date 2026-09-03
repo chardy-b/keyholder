@@ -165,7 +165,7 @@ _VERCEL_TARGETS = frozenset({"production", "staging"})
 _VERCEL_PROJECT_ID = re.compile(r"^prj_[A-Za-z0-9_]+$")
 _VERCEL_DEPLOYMENT_ID = re.compile(r"^dpl_[A-Za-z0-9_]+$")
 _VERCEL_DEPLOYMENT_HOST = re.compile(
-    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:-[a-z0-9-]+)*\.vercel\.app$"
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.vercel\.app$"
 )
 
 
