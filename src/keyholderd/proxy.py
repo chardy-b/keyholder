@@ -57,6 +57,7 @@ class ProxyCapability:
     allowed_methods: frozenset[str]
     allowed_routes: frozenset[str]
     expires_at: datetime
+    operation_profile: str = ""
 
 
 @dataclass
@@ -142,7 +143,50 @@ def validated_proxy_grant(
     methods = frozenset(method.upper() for method in raw_methods)
     if not methods.issubset(SUPPORTED_METHODS):
         raise ProxyConfigurationError("allowed_methods contains an unsupported method")
+    profile = grant.get("operation_profile", "")
+    if profile:
+        if profile != "vercel_atlas" or upstream_base_url != "https://api.vercel.com" or methods != frozenset({"POST"}) or routes != frozenset({"/v1/vercel"}):
+            raise ProxyConfigurationError("invalid vercel_atlas operation profile")
+        if set(grant.get("bitwarden_refs", {})) != {"upstream_api_key"}:
+            raise ProxyConfigurationError("vercel_atlas requires upstream_api_key only")
     return upstream_base_url, methods, routes
+
+
+_ATLAS_NAME = re.compile(r"^atlas-[a-z0-9-]+$")
+_ATLAS_DOMAIN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.chezchardin\\.com$")
+
+
+def _vercel_operation(body: bytes) -> tuple[str, str, bytes | None]:
+    try:
+        request = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProxyRequestError("request body must be valid JSON") from exc
+    if not isinstance(request, dict) or not isinstance(request.get("operation"), str):
+        raise ProxyRequestError("operation request must be an object")
+    operation = request["operation"]
+    fields = {"create_project": {"operation", "project_name"}, "get_project": {"operation", "project_name"}, "add_domain": {"operation", "project_name", "domain"}, "list_domains": {"operation", "project_name"}, "list_deployments": {"operation", "project_name", "limit", "target"}}
+    if operation not in fields or set(request) - fields[operation]:
+        raise ProxyRequestError("invalid operation fields")
+    name = request.get("project_name")
+    if not isinstance(name, str) or _ATLAS_NAME.fullmatch(name) is None:
+        raise ProxyRequestError("invalid project_name")
+    if operation == "create_project":
+        payload = {"name": name, "framework": "nextjs", "gitRepository": {"type": "github", "repo": f"chardy-b/{name}"}, "productionBranch": "main"}
+        return "POST", "/v10/projects", json.dumps(payload, separators=(",", ":")).encode()
+    if operation == "get_project":
+        return "GET", "/v9/projects?search=" + name, None
+    if operation == "add_domain":
+        domain = request.get("domain")
+        if not isinstance(domain, str) or _ATLAS_DOMAIN.fullmatch(domain) is None:
+            raise ProxyRequestError("invalid domain")
+        return "POST", f"/v10/projects/{name}/domains", json.dumps({"name": domain}, separators=(",", ":")).encode()
+    if operation == "list_domains":
+        return "GET", f"/v9/projects/{name}/domains", None
+    limit, target = request.get("limit", 20), request.get("target")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100 or (target is not None and target not in {"production", "preview", "development"}):
+        raise ProxyRequestError("invalid deployment options")
+    query = f"projectId={name}&limit={limit}" + (f"&target={target}" if target else "")
+    return "GET", "/v6/deployments?" + query, None
 
 
 def validated_content_length(
@@ -227,6 +271,7 @@ class CapabilityStore:
             allowed_methods=methods,
             allowed_routes=routes,
             expires_at=expires_at,
+            operation_profile=str(grant.get("operation_profile", "")),
         )
         with self._lock:
             self._capabilities[self._token_hash(token)] = _CapabilityState(capability)
@@ -495,25 +540,32 @@ def forward_request(
         }
         if audit_path is not None:
             write_audit_event(audit_path, {"event": "proxy_attempt", **audit_base})
-        upstream_headers = _forward_headers(headers)
+        upstream_method, upstream_target, upstream_body = method.upper(), target, body
+        if capability.operation_profile == "vercel_atlas":
+            if method.upper() != "POST" or parsed_target.path != "/v1/vercel" or parsed_target.query:
+                raise ProxyRequestError("invalid vercel operation route")
+            upstream_method, upstream_target, upstream_body = _vercel_operation(body)
+            upstream_headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        else:
+            upstream_headers = _forward_headers(headers)
         upstream_headers["Authorization"] = f"Bearer {capability.upstream_api_key}"
         try:
-            upstream_url = capability.upstream_base_url.rstrip("/") + target
+            upstream_url = capability.upstream_base_url.rstrip("/") + upstream_target
             if sender is None:
                 result = _default_upstream_request(
-                    method=method.upper(),
+                    method=upstream_method,
                     url=upstream_url,
                     headers=upstream_headers,
-                    body=body,
+                    body=upstream_body or b"",
                     max_response_bytes=max_response_bytes,
                     timeout_seconds=upstream_timeout_seconds,
                 )
             else:
                 response = sender(
-                    method=method.upper(),
+                    method=upstream_method,
                     url=upstream_url,
                     headers=upstream_headers,
-                    data=body,
+                    data=upstream_body,
                     timeout=upstream_timeout_seconds,
                     allow_redirects=False,
                     stream=True,

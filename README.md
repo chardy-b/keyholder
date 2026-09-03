@@ -328,3 +328,7 @@ pool are future optimizations.
 ## License
 
 TBD.
+
+## Vercel Atlas operation profile
+
+Define a `local_proxy` grant with `operation_profile: vercel_atlas` and the exact route/method constraints shown in `packaging/policy.example.yaml`. Issue it through `keyholder issue` (or prefer `keyholder run`); the caller receives only an opaque capability. POST the documented operation JSON to the loopback proxy at `/v1/vercel`. The upstream token remains in BWS and is never placed in caller headers or audit records. This profile maps only the fixed supported operations and rejects arbitrary paths, queries, headers, and fields. See the current [Vercel REST API documentation](https://vercel.com/docs/rest-api).
