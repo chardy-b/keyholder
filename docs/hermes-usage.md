@@ -42,3 +42,40 @@ The listener is off for backward compatibility unless the operator sets
 `proxy.enabled: true` in the daemon policy.
 Capabilities are daemon-memory state and fail closed on restart; issue a new
 capability if the daemon restarts even if its old lease row remains in SQLite.
+
+## Atlas Vercel control-plane operations
+
+Use the `vercel-atlas-control` local-proxy grant for Atlas site provisioning. The
+team-scoped Vercel token remains inside Keyholder; the child command receives only
+a short-lived `KEYHOLDER_CAPABILITY_TOKEN`:
+
+```bash
+keyholder run vercel-atlas-control \
+  --env KEYHOLDER_CAPABILITY_TOKEN \
+  --ttl 300 \
+  --reason "inspect Atlas Vercel project" -- \
+  sh -c 'curl -fsS http://127.0.0.1:8787/v1/vercel \
+    -H "Authorization: Bearer $KEYHOLDER_CAPABILITY_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "{\"operation\":\"get_project\",\"project_name\":\"atlas-example\"}"'
+```
+
+The profile accepts only `create_project`, `get_project`, `add_domain`,
+`list_domains`, and `list_deployments`. Project names must match `atlas-*`, GitHub
+repositories are derived under `chardy-b`, and custom domains must be a single
+label under `chezchardin.com`. The caller cannot supply upstream paths, headers,
+team overrides, arbitrary repository owners, environment variables, or destructive
+operations.
+
+Vercel's current create-project API does not accept a production-branch setting.
+The website factory must confirm that the GitHub repository default branch is
+`main` before project creation and verify the linked production branch during
+project readback.
+
+Endpoint references:
+
+- https://vercel.com/docs/rest-api/projects/create-a-new-project
+- https://vercel.com/docs/rest-api/projects/retrieve-a-list-of-projects
+- https://vercel.com/docs/rest-api/projects/add-a-domain-to-a-project
+- https://vercel.com/docs/rest-api/projects/retrieve-project-domains-by-project-by-id-or-name
+- https://vercel.com/docs/rest-api/deployments/list-deployments
