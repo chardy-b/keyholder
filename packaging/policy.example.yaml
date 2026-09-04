@@ -53,6 +53,18 @@ callers:
             session_tags:
               app: hermes
               profile: default
+          - name: vercel-atlas-control
+            provider: local_proxy
+            operation_profile: vercel_atlas
+            ttl_seconds: 300
+            max_ttl_seconds: 600
+            bitwarden_refs:
+              upstream_api_key: "key:vercel-team-token"
+            upstream_base_url: https://api.vercel.com
+            allowed_methods:
+              - POST
+            allowed_routes:
+              - /v1/vercel
           - name: openrouter-chat-proxy
             provider: local_proxy
             ttl_seconds: 300

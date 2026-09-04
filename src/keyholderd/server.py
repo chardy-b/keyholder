@@ -23,6 +23,7 @@ from .providers.aws_sts import AwsStsProvider
 from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
 from .providers.local_proxy import LocalProxyProvider
+
 from .proxy import ProxyHTTPServer
 
 LOG = logging.getLogger(__name__)
@@ -65,6 +66,8 @@ def _issue_credential(config: dict[str, Any], caller: str, profile: str, grant_n
     provider = PROVIDERS.get(grant["provider"])
     if provider is None:
         raise ServerError(f"unknown provider {grant['provider']!r}", 500)
+    if isinstance(provider, LocalProxyProvider):
+        provider.validate_grant(grant)
     secrets = _resolver(config).resolve_refs(grant.get("bitwarden_refs", {}))
     if isinstance(provider, LocalProxyProvider):
         provider.validate(grant, secrets)
@@ -81,6 +84,7 @@ def _issue_credential(config: dict[str, Any], caller: str, profile: str, grant_n
             profile=profile,
             grant_name=grant_name,
         )
+
     write_audit_event(audit, {"event":"issue", "caller":caller, "profile":profile, "grant":grant_name, "provider":cred.provider, "ttl_seconds":ttl, "lease_id":lease.lease_id, "reason":reason, "scope_summary":cred.scope_summary})
     return cred, lease, ttl
 
@@ -116,6 +120,7 @@ def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) 
     provider = PROVIDERS.get(lease.provider)
     if isinstance(provider, LocalProxyProvider):
         provider.store.revoke_lease(lease.lease_id)
+
     write_audit_event(audit, {"event":"revoke", "caller":caller, "grant":"", "provider":"", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
     return {"revoked": True, "lease_id": request["lease_id"]}
 

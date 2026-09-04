@@ -12,11 +12,11 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterator, Mapping, cast
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import requests
 
@@ -57,6 +57,7 @@ class ProxyCapability:
     allowed_methods: frozenset[str]
     allowed_routes: frozenset[str]
     expires_at: datetime
+    operation_profile: str = ""
 
 
 @dataclass
@@ -142,7 +143,286 @@ def validated_proxy_grant(
     methods = frozenset(method.upper() for method in raw_methods)
     if not methods.issubset(SUPPORTED_METHODS):
         raise ProxyConfigurationError("allowed_methods contains an unsupported method")
+    profile = grant.get("operation_profile", "")
+    if profile:
+        if (
+            profile != "vercel_atlas"
+            or upstream_base_url != "https://api.vercel.com"
+            or methods != frozenset({"POST"})
+            or routes != frozenset({"/v1/vercel"})
+        ):
+            raise ProxyConfigurationError("invalid vercel_atlas operation profile")
+        if set(grant.get("bitwarden_refs", {})) != {"upstream_api_key"}:
+            raise ProxyConfigurationError("vercel_atlas requires upstream_api_key only")
     return upstream_base_url, methods, routes
+
+
+_ATLAS_NAME = re.compile(r"^atlas-[a-z0-9]+(?:-[a-z0-9]+)*$")
+_ATLAS_DOMAIN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.chezchardin\.com$"
+)
+_VERCEL_TARGETS = frozenset({"production", "staging"})
+_VERCEL_PROJECT_ID = re.compile(r"^prj_[A-Za-z0-9_]+$")
+_VERCEL_DEPLOYMENT_ID = re.compile(r"^dpl_[A-Za-z0-9_]+$")
+_VERCEL_DEPLOYMENT_HOST = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.vercel\.app$"
+)
+
+
+@dataclass(frozen=True)
+class VercelAtlasOperation:
+    operation: str
+    resource: str
+    method: str
+    target: str
+    body: bytes | None
+    domain: str | None = None
+    project_id: str | None = None
+
+
+def _vercel_operation(body: bytes) -> VercelAtlasOperation:
+    try:
+        request = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProxyRequestError("request body must be valid JSON") from exc
+    if not isinstance(request, dict) or not isinstance(request.get("operation"), str):
+        raise ProxyRequestError("operation request must be an object")
+
+    operation = request["operation"]
+    required_fields = {
+        "create_project": {"operation", "project_name"},
+        "get_project": {"operation", "project_name"},
+        "add_domain": {"operation", "project_name", "domain"},
+        "list_domains": {"operation", "project_name"},
+        "list_deployments": {"operation", "project_name"},
+    }
+    optional_fields = {"list_deployments": {"limit", "target"}}
+    if operation not in required_fields:
+        raise ProxyRequestError("operation is not permitted")
+    allowed = required_fields[operation] | optional_fields.get(operation, set())
+    if set(request) != required_fields[operation] and not (
+        required_fields[operation] <= set(request) <= allowed
+    ):
+        raise ProxyRequestError("invalid operation fields")
+
+    name = request.get("project_name")
+    if not isinstance(name, str) or _ATLAS_NAME.fullmatch(name) is None:
+        raise ProxyRequestError("invalid project_name")
+
+    if operation == "create_project":
+        payload = {
+            "name": name,
+            "framework": "nextjs",
+            "gitRepository": {
+                "type": "github",
+                "repo": f"chardy-b/{name}",
+            },
+        }
+        return VercelAtlasOperation(
+            operation,
+            name,
+            "POST",
+            "/v11/projects",
+            json.dumps(payload, separators=(",", ":")).encode(),
+        )
+    if operation == "get_project":
+        return VercelAtlasOperation(
+            operation,
+            name,
+            "GET",
+            "/v10/projects?" + urlencode({"search": name}),
+            None,
+        )
+    if operation == "add_domain":
+        domain = request.get("domain")
+        if not isinstance(domain, str) or _ATLAS_DOMAIN.fullmatch(domain) is None:
+            raise ProxyRequestError("invalid domain")
+        return VercelAtlasOperation(
+            operation,
+            name,
+            "POST",
+            f"/v10/projects/{name}/domains",
+            json.dumps({"name": domain}, separators=(",", ":")).encode(),
+            domain=domain,
+        )
+    if operation == "list_domains":
+        return VercelAtlasOperation(
+            operation, name, "GET", f"/v9/projects/{name}/domains", None
+        )
+
+    limit = request.get("limit", 20)
+    target = request.get("target")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= 100
+        or (target is not None and target not in _VERCEL_TARGETS)
+    ):
+        raise ProxyRequestError("invalid deployment options")
+    query: dict[str, str | int] = {"projectId": name, "limit": limit}
+    if target is not None:
+        query["target"] = target
+    return VercelAtlasOperation(
+        operation,
+        name,
+        "GET",
+        "/v7/deployments?" + urlencode(query),
+        None,
+    )
+
+
+def _bind_vercel_project_id(
+    operation: VercelAtlasOperation, project_id: str
+) -> VercelAtlasOperation:
+    if not _VERCEL_PROJECT_ID.fullmatch(project_id):
+        raise ProxyUpstreamError("Vercel response has invalid project id")
+    encoded_id = quote(project_id, safe="")
+    if operation.operation in {"add_domain", "list_domains"}:
+        return replace(
+            operation,
+            target=f"/v10/projects/{encoded_id}/domains"
+            if operation.operation == "add_domain"
+            else f"/v9/projects/{encoded_id}/domains",
+            project_id=project_id,
+        )
+    if operation.operation == "list_deployments":
+        query = dict(parse_qsl(urlsplit(operation.target).query, strict_parsing=True))
+        query["projectId"] = project_id
+        return replace(
+            operation,
+            target="/v7/deployments?" + urlencode(query),
+            project_id=project_id,
+        )
+    return operation
+
+
+def _required_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ProxyUpstreamError(f"Vercel response has invalid {field}")
+    return value
+
+
+def _required_project_id(value: Any) -> str:
+    project_id = _required_string(value, "project id")
+    if not _VERCEL_PROJECT_ID.fullmatch(project_id):
+        raise ProxyUpstreamError("Vercel response has invalid project id")
+    return project_id
+
+
+def _normalized_json(status: int, payload: dict[str, Any]) -> ForwardResponse:
+    return ForwardResponse(
+        status=status,
+        headers={"Content-Type": "application/json"},
+        body=json.dumps(payload, separators=(",", ":")).encode(),
+    )
+
+
+def _normalize_vercel_response(
+    operation: VercelAtlasOperation, response: ForwardResponse
+) -> ForwardResponse:
+    if not 200 <= response.status < 300:
+        return _normalized_json(response.status, {"error": "vercel request failed"})
+    try:
+        payload = json.loads(response.body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProxyUpstreamError("Vercel returned malformed JSON") from exc
+    if not isinstance(payload, dict):
+        raise ProxyUpstreamError("Vercel response must be an object")
+
+    if operation.operation == "create_project":
+        project_id = _required_project_id(payload.get("id"))
+        if payload.get("name") != operation.resource:
+            raise ProxyUpstreamError("Vercel returned the wrong project")
+        return _normalized_json(
+            response.status, {"id": project_id, "name": operation.resource}
+        )
+
+    if operation.operation == "get_project":
+        projects = payload.get("projects")
+        if not isinstance(projects, list):
+            raise ProxyUpstreamError("Vercel response has invalid projects")
+        matches = [
+            project
+            for project in projects
+            if isinstance(project, dict) and project.get("name") == operation.resource
+        ]
+        if len(matches) != 1:
+            raise ProxyUpstreamError("Vercel did not return one exact project")
+        project_id = _required_project_id(matches[0].get("id"))
+        return _normalized_json(
+            response.status, {"id": project_id, "name": operation.resource}
+        )
+
+    if operation.operation == "add_domain":
+        if payload.get("name") != operation.domain:
+            raise ProxyUpstreamError("Vercel returned the wrong domain")
+        project_id = _required_project_id(payload.get("projectId"))
+        if project_id != operation.project_id:
+            raise ProxyUpstreamError("Vercel returned the wrong project")
+        verified = payload.get("verified")
+        if not isinstance(verified, bool):
+            raise ProxyUpstreamError("Vercel returned invalid domain verification")
+        return _normalized_json(
+            response.status,
+            {"name": operation.domain, "project_id": project_id, "verified": verified},
+        )
+
+    if operation.operation == "list_domains":
+        domains = payload.get("domains")
+        if not isinstance(domains, list):
+            raise ProxyUpstreamError("Vercel response has invalid domains")
+        normalized_domains = []
+        for domain in domains:
+            if not isinstance(domain, dict):
+                raise ProxyUpstreamError("Vercel response has invalid domain entry")
+            name = _required_string(domain.get("name"), "domain name")
+            if not _ATLAS_DOMAIN.fullmatch(name):
+                raise ProxyUpstreamError("Vercel returned an unapproved domain")
+            project_id = _required_project_id(domain.get("projectId"))
+            if project_id != operation.project_id:
+                raise ProxyUpstreamError("Vercel returned the wrong project")
+            verified = domain.get("verified")
+            if not isinstance(verified, bool):
+                raise ProxyUpstreamError("Vercel returned invalid domain verification")
+            normalized_domains.append(
+                {"name": name, "project_id": project_id, "verified": verified}
+            )
+        return _normalized_json(response.status, {"domains": normalized_domains})
+
+    deployments = payload.get("deployments")
+    if not isinstance(deployments, list):
+        raise ProxyUpstreamError("Vercel response has invalid deployments")
+    normalized_deployments = []
+    for deployment in deployments:
+        if not isinstance(deployment, dict):
+            raise ProxyUpstreamError("Vercel response has invalid deployment entry")
+        deployment_id = _required_string(deployment.get("uid"), "deployment id")
+        if not _VERCEL_DEPLOYMENT_ID.fullmatch(deployment_id):
+            raise ProxyUpstreamError("Vercel returned an invalid deployment id")
+        name = _required_string(deployment.get("name"), "deployment name")
+        if name != operation.resource:
+            raise ProxyUpstreamError("Vercel returned a deployment for another project")
+        project_id = _required_project_id(deployment.get("projectId"))
+        if project_id != operation.project_id:
+            raise ProxyUpstreamError("Vercel returned the wrong project")
+        url = _required_string(deployment.get("url"), "deployment URL")
+        if not _VERCEL_DEPLOYMENT_HOST.fullmatch(url):
+            raise ProxyUpstreamError("Vercel returned an invalid deployment URL")
+        ready_state = _required_string(
+            deployment.get("readyState"), "deployment ready state"
+        )
+        normalized_deployments.append(
+            {
+                "uid": deployment_id,
+                "name": name,
+                "project_id": project_id,
+                "url": url,
+                "ready_state": ready_state,
+            }
+        )
+    return _normalized_json(
+        response.status, {"deployments": normalized_deployments}
+    )
 
 
 def validated_content_length(
@@ -227,6 +507,7 @@ class CapabilityStore:
             allowed_methods=methods,
             allowed_routes=routes,
             expires_at=expires_at,
+            operation_profile=str(grant.get("operation_profile", "")),
         )
         with self._lock:
             self._capabilities[self._token_hash(token)] = _CapabilityState(capability)
@@ -482,6 +763,26 @@ def forward_request(
     if not target.startswith("/") or parsed_target.scheme or parsed_target.netloc or parsed_target.fragment:
         raise ProxyRequestError("request target must use origin-form")
     with store.dispatch(token, method, parsed_target.path) as capability:
+        vercel_operation: VercelAtlasOperation | None = None
+        upstream_method, upstream_target, upstream_body = method.upper(), target, body
+        if capability.operation_profile == "vercel_atlas":
+            if (
+                method.upper() != "POST"
+                or parsed_target.path != "/v1/vercel"
+                or parsed_target.query
+            ):
+                raise ProxyRequestError("invalid vercel operation route")
+            vercel_operation = _vercel_operation(body)
+            upstream_method = vercel_operation.method
+            upstream_target = vercel_operation.target
+            upstream_body = vercel_operation.body
+            upstream_headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+        else:
+            upstream_headers = _forward_headers(headers)
+
         audit_base = {
             "caller": capability.caller or "capability",
             "profile": capability.profile,
@@ -493,52 +794,97 @@ def forward_request(
             "method": method.upper(),
             "route": parsed_target.path,
         }
+        if vercel_operation is not None:
+            audit_base["operation"] = vercel_operation.operation
+            audit_base["resource"] = vercel_operation.resource
         if audit_path is not None:
             write_audit_event(audit_path, {"event": "proxy_attempt", **audit_base})
-        upstream_headers = _forward_headers(headers)
         upstream_headers["Authorization"] = f"Bearer {capability.upstream_api_key}"
-        try:
-            upstream_url = capability.upstream_base_url.rstrip("/") + target
+
+        def perform_upstream(
+            request_method: str, request_target: str, request_body: bytes | None
+        ) -> ForwardResponse:
+            upstream_url = capability.upstream_base_url.rstrip("/") + request_target
             if sender is None:
-                result = _default_upstream_request(
-                    method=method.upper(),
+                return _default_upstream_request(
+                    method=request_method,
                     url=upstream_url,
                     headers=upstream_headers,
-                    body=body,
+                    body=request_body or b"",
                     max_response_bytes=max_response_bytes,
                     timeout_seconds=upstream_timeout_seconds,
                 )
-            else:
-                response = sender(
-                    method=method.upper(),
-                    url=upstream_url,
-                    headers=upstream_headers,
-                    data=body,
-                    timeout=upstream_timeout_seconds,
-                    allow_redirects=False,
-                    stream=True,
-                )
-                try:
-                    declared_length = response.headers.get("Content-Length")
-                    if declared_length is not None and int(declared_length) > max_response_bytes:
-                        raise ProxyUpstreamError("upstream response is too large")
-                    if hasattr(response, "raw"):
-                        response_body = response.raw.read(max_response_bytes + 1, decode_content=False)
-                    else:
-                        response_body = bytes(response.content)
-                    if len(response_body) > max_response_bytes:
-                        raise ProxyUpstreamError("upstream response is too large")
-                    result = ForwardResponse(
-                        status=int(response.status_code),
-                        headers=_validated_upstream_headers(list(response.headers.items())),
-                        body=response_body,
+            response = sender(
+                method=request_method,
+                url=upstream_url,
+                headers=upstream_headers,
+                data=request_body,
+                timeout=upstream_timeout_seconds,
+                allow_redirects=False,
+                stream=True,
+            )
+            try:
+                declared_length = response.headers.get("Content-Length")
+                if (
+                    declared_length is not None
+                    and int(declared_length) > max_response_bytes
+                ):
+                    raise ProxyUpstreamError("upstream response is too large")
+                if hasattr(response, "raw"):
+                    response_body = response.raw.read(
+                        max_response_bytes + 1, decode_content=False
                     )
-                    if not 200 <= result.status <= 599:
-                        raise ProxyUpstreamError("upstream returned an unsupported response status")
-                finally:
-                    close = getattr(response, "close", None)
-                    if close is not None:
-                        close()
+                else:
+                    response_body = bytes(response.content)
+                if len(response_body) > max_response_bytes:
+                    raise ProxyUpstreamError("upstream response is too large")
+                forwarded = ForwardResponse(
+                    status=int(response.status_code),
+                    headers=_validated_upstream_headers(list(response.headers.items())),
+                    body=response_body,
+                )
+                if not 200 <= forwarded.status <= 599:
+                    raise ProxyUpstreamError(
+                        "upstream returned an unsupported response status"
+                    )
+                return forwarded
+            finally:
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
+
+        try:
+            if vercel_operation is not None and vercel_operation.operation in {
+                "add_domain",
+                "list_domains",
+                "list_deployments",
+            }:
+                lookup = _vercel_operation(
+                    json.dumps(
+                        {
+                            "operation": "get_project",
+                            "project_name": vercel_operation.resource,
+                        },
+                        separators=(",", ":"),
+                    ).encode()
+                )
+                lookup_result = perform_upstream(
+                    lookup.method, lookup.target, lookup.body
+                )
+                lookup_normalized = _normalize_vercel_response(lookup, lookup_result)
+                project_id = json.loads(lookup_normalized.body)["id"]
+                vercel_operation = _bind_vercel_project_id(
+                    vercel_operation, project_id
+                )
+                upstream_method = vercel_operation.method
+                upstream_target = vercel_operation.target
+                upstream_body = vercel_operation.body
+
+            result = perform_upstream(
+                upstream_method, upstream_target, upstream_body
+            )
+            if vercel_operation is not None:
+                result = _normalize_vercel_response(vercel_operation, result)
         except Exception as exc:
             if audit_path is not None:
                 write_audit_event(

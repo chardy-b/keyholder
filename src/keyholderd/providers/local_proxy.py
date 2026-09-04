@@ -33,6 +33,10 @@ class LocalProxyProvider:
     def validate(grant: dict, secrets: dict[str, str]) -> None:
         validated_proxy_grant(grant, secrets)
 
+    @staticmethod
+    def validate_grant(grant: dict) -> None:
+        validated_proxy_grant(grant, {"upstream_api_key": "placeholder"})
+
     def activate(
         self,
         credential: IssuedCredential,
