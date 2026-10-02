@@ -5,9 +5,23 @@ bitwarden:
   project_id: "00000000-0000-0000-0000-000000000000"
   cache_seconds: 300
 
+# Bitwarden references must be either a canonical UUID or key:<nonblank-name>.
+# A key: reference matches exactly within the configured Bitwarden project.
+# Use placeholders only; never commit a real ID or secret.
+
 paths:
   leases_db: /var/lib/keyholder/leases.db
   audit_log: /var/log/keyholder/audit.jsonl
+
+proxy:
+  enabled: true
+  host: 127.0.0.1
+  port: 8787
+  max_body_bytes: 8388608
+  max_response_bytes: 8388608
+  max_workers: 16
+  request_timeout_seconds: 15
+  upstream_timeout_seconds: 30
 
 callers:
   hermes:
@@ -20,8 +34,8 @@ callers:
             ttl_seconds: 600
             max_ttl_seconds: 900
             bitwarden_refs:
-              app_id: "github-app-id"
-              private_key_pem: "github-app-private-key-pem"
+              app_id: "key:github-app-id"
+              private_key_pem: "key:github-app-private-key-pem"
             installation_id: 12345678
             permissions:
               metadata: read
@@ -32,19 +46,34 @@ callers:
             ttl_seconds: 900
             max_ttl_seconds: 1800
             bitwarden_refs:
-              aws_access_key_id: "aws-source-access-key-id"
-              aws_secret_access_key: "aws-source-secret-access-key"
+              aws_access_key_id: "key:aws-source-access-key-id"
+              aws_secret_access_key: "key:aws-source-secret-access-key"
             role_arn: "arn:aws:iam::123456789012:role/hermes-s3-logs-read"
             external_id: "hermes-local"
             session_tags:
               app: hermes
               profile: default
+          - name: vercel-atlas-control
+            provider: local_proxy
+            operation_profile: vercel_atlas
+            ttl_seconds: 300
+            max_ttl_seconds: 600
+            bitwarden_refs:
+              upstream_api_key: "key:vercel-team-token"
+            upstream_base_url: https://api.vercel.com
+            allowed_methods:
+              - POST
+            allowed_routes:
+              - /v1/vercel
           - name: openrouter-chat-proxy
             provider: local_proxy
             ttl_seconds: 300
             max_ttl_seconds: 600
+            upstream_base_url: https://openrouter.ai/api
             bitwarden_refs:
-              upstream_api_key: "openrouter-api-key"
+              upstream_api_key: "key:openrouter"
+            allowed_methods:
+              - POST
             allowed_routes:
               - /v1/chat/completions
           - name: google-calendar-read

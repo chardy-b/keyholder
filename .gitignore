@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 .coverage
 htmlcov/
+.hermes/
 packaging/policy.local.yaml
 
 # Build artifacts

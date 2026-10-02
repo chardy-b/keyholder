@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import socket
 import socketserver
 import subprocess
 import grp
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -22,6 +24,8 @@ from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
 from .providers.google_oauth import GoogleOAuthProvider
 from .providers.local_proxy import LocalProxyProvider
+
+from .proxy import ProxyHTTPServer
 
 LOG = logging.getLogger(__name__)
 
@@ -69,10 +73,25 @@ def _issue_credential(config: dict[str, Any], caller: str, profile: str, grant_n
             provider.validate_secret_refs(grant.get("bitwarden_refs"))
         except ValueError as exc:
             raise ServerError(str(exc), 400) from exc
+    if isinstance(provider, LocalProxyProvider):
+        provider.validate_grant(grant)
     secrets = _resolver(config).resolve_refs(grant.get("bitwarden_refs", {}))
+    if isinstance(provider, LocalProxyProvider):
+        provider.validate(grant, secrets)
     cred = provider.issue(grant, secrets, ttl)
     lease_db, audit = _audit_paths(config)
     lease = LeaseStore(lease_db).create_lease(caller, profile, grant_name, cred.provider, ttl, reason)
+    if isinstance(provider, LocalProxyProvider):
+        provider.activate(
+            cred,
+            lease.lease_id,
+            grant,
+            secrets,
+            caller=caller,
+            profile=profile,
+            grant_name=grant_name,
+        )
+
     write_audit_event(audit, {"event":"issue", "caller":caller, "profile":profile, "grant":grant_name, "provider":cred.provider, "ttl_seconds":ttl, "lease_id":lease.lease_id, "reason":reason, "scope_summary":cred.scope_summary})
     return cred, lease, ttl
 
@@ -100,7 +119,15 @@ def handle_run(config: dict[str, Any], caller: str, request: dict[str, Any]) -> 
 
 def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) -> dict[str, Any]:
     lease_db, audit = _audit_paths(config)
-    LeaseStore(lease_db).revoke(request["lease_id"])
+    store = LeaseStore(lease_db)
+    lease = store.get_lease(request["lease_id"])
+    if lease.caller_user != caller:
+        raise ServerError("lease does not belong to caller", 403)
+    store.revoke(lease.lease_id)
+    provider = PROVIDERS.get(lease.provider)
+    if isinstance(provider, LocalProxyProvider):
+        provider.store.revoke_lease(lease.lease_id)
+
     write_audit_event(audit, {"event":"revoke", "caller":caller, "grant":"", "provider":"", "ttl_seconds":0, "lease_id":request["lease_id"], "reason":request.get("reason", "")})
     return {"revoked": True, "lease_id": request["lease_id"]}
 
@@ -112,6 +139,35 @@ class UnixHTTPServer(socketserver.UnixStreamServer):
         try: os.unlink(socket_path)
         except FileNotFoundError: pass
         super().__init__(socket_path, KeyholderHandler)
+
+
+def proxy_listener_enabled(config: dict[str, Any]) -> bool:
+    return config.get("proxy", {}).get("enabled") is True
+
+
+def create_proxy_server(config: dict[str, Any]) -> ProxyHTTPServer:
+    proxy_config = config.get("proxy", {})
+    host = str(proxy_config.get("host", "127.0.0.1"))
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError as exc:
+        raise ServerError("proxy host must be an explicit loopback IP address", 500) from exc
+    if not is_loopback:
+        raise ServerError("proxy host must be loopback", 500)
+    provider = PROVIDERS["local_proxy"]
+    if not isinstance(provider, LocalProxyProvider):
+        raise ServerError("local_proxy provider is unavailable", 500)
+    _lease_db, audit_path = _audit_paths(config)
+    return ProxyHTTPServer(
+        (host, int(proxy_config.get("port", 8787))),
+        store=provider.store,
+        audit_path=audit_path,
+        max_body_bytes=int(proxy_config.get("max_body_bytes", 8 * 1024 * 1024)),
+        max_response_bytes=int(proxy_config.get("max_response_bytes", 8 * 1024 * 1024)),
+        max_workers=int(proxy_config.get("max_workers", 16)),
+        request_timeout_seconds=float(proxy_config.get("request_timeout_seconds", 15)),
+        upstream_timeout_seconds=float(proxy_config.get("upstream_timeout_seconds", 30)),
+    )
 
 
 class KeyholderHandler(BaseHTTPRequestHandler):
@@ -156,13 +212,31 @@ class KeyholderHandler(BaseHTTPRequestHandler):
 
 def serve(config_path: str, socket_path: str, socket_group: str | None = None) -> None:
     config = load_policy(config_path)
-    with UnixHTTPServer(socket_path, config) as server:
-        if socket_group:
-            gid = grp.getgrnam(socket_group).gr_gid
-            os.chown(socket_path, -1, gid)
-        os.chmod(socket_path, 0o660)
-        LOG.info("keyholderd listening on %s", socket_path)
-        server.serve_forever()
+    proxy_server = create_proxy_server(config) if proxy_listener_enabled(config) else None
+    proxy_thread = None
+    if proxy_server is not None:
+        proxy_thread = threading.Thread(target=proxy_server.serve_forever, name="keyholder-proxy", daemon=True)
+        proxy_thread.start()
+    try:
+        with UnixHTTPServer(socket_path, config) as server:
+            if socket_group:
+                gid = grp.getgrnam(socket_group).gr_gid
+                os.chown(socket_path, -1, gid)
+            os.chmod(socket_path, 0o660)
+            LOG.info("keyholderd listening on %s", socket_path)
+            if proxy_server is not None:
+                LOG.info(
+                    "keyholder proxy listening on http://%s:%s",
+                    proxy_server.server_address[0],
+                    proxy_server.server_address[1],
+                )
+            server.serve_forever()
+    finally:
+        if proxy_server is not None:
+            proxy_server.shutdown()
+            proxy_server.server_close()
+        if proxy_thread is not None:
+            proxy_thread.join(timeout=5)
 
 
 def main(argv: list[str] | None = None) -> int:
