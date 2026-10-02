@@ -22,13 +22,14 @@ from .policy import PolicyError, get_grant, grants_for_caller, load_policy, vali
 from .providers.aws_sts import AwsStsProvider
 from .providers.fake import FakeProvider
 from .providers.github_app import GitHubAppProvider
+from .providers.google_oauth import GoogleOAuthProvider
 from .providers.local_proxy import LocalProxyProvider
 
 from .proxy import ProxyHTTPServer
 
 LOG = logging.getLogger(__name__)
 
-PROVIDERS = {"fake": FakeProvider(), "github_app": GitHubAppProvider(), "aws_sts": AwsStsProvider(), "local_proxy": LocalProxyProvider()}
+PROVIDERS = {"fake": FakeProvider(), "github_app": GitHubAppProvider(), "aws_sts": AwsStsProvider(), "google_oauth": GoogleOAuthProvider(), "local_proxy": LocalProxyProvider()}
 
 
 class ServerError(RuntimeError):
@@ -66,6 +67,12 @@ def _issue_credential(config: dict[str, Any], caller: str, profile: str, grant_n
     provider = PROVIDERS.get(grant["provider"])
     if provider is None:
         raise ServerError(f"unknown provider {grant['provider']!r}", 500)
+    if isinstance(provider, GoogleOAuthProvider):
+        try:
+            provider.validate(grant)
+            provider.validate_secret_refs(grant.get("bitwarden_refs"))
+        except ValueError as exc:
+            raise ServerError(str(exc), 400) from exc
     if isinstance(provider, LocalProxyProvider):
         provider.validate_grant(grant)
     secrets = _resolver(config).resolve_refs(grant.get("bitwarden_refs", {}))

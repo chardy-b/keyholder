@@ -43,6 +43,17 @@ The listener is off for backward compatibility unless the operator sets
 Capabilities are daemon-memory state and fail closed on restart; issue a new
 capability if the daemon restarts even if its old lease row remains in SQLite.
 
+## Google Workspace CLI
+
+For Google Workspace CLI, use a purpose-named grant such as `google-calendar-read`:
+
+```bash
+keyholder run google-calendar-read --env GOOGLE_WORKSPACE_CLI_TOKEN --ttl 300 --reason "read calendar" -- \
+  gws calendar events list --calendarId primary
+```
+
+Do not use `keyholder issue` for this in Hermes. Google OAuth scopes are fixed when the refresh token is consented; a grant label does not narrow a broader OAuth grant. Google's `expires_in` controls direct token validity, while Keyholder's TTL controls the broker lease only.
+
 ## Atlas Vercel control-plane operations
 
 Use the `vercel-atlas-control` local-proxy grant for Atlas site provisioning. The
@@ -79,3 +90,4 @@ Endpoint references:
 - https://vercel.com/docs/rest-api/projects/add-a-domain-to-a-project
 - https://vercel.com/docs/rest-api/projects/retrieve-project-domains-by-project-by-id-or-name
 - https://vercel.com/docs/rest-api/deployments/list-deployments
+>>>>>>> origin/main
