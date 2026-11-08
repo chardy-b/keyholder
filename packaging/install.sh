@@ -9,6 +9,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Keep in sync with pyproject.toml (tests/test_install_script.py checks this).
+BITWARDEN_SDK_REQ="bitwarden-sdk==2.1.0"
+
 CLIENT_USER=""
 BWS_TOKEN_FILE=""
 NO_START=0
@@ -121,6 +124,10 @@ install_venv() {
   else
     "$venv/bin/pip" install --force-reinstall --no-deps "$REPO_ROOT"
     log "reinstalled keyholder into existing venv"
+    # --no-deps above skips new dependencies; install only the pinned SDK (and its
+    # own small dependency tree) without upgrading anything already present.
+    "$venv/bin/pip" install "$BITWARDEN_SDK_REQ"
+    log "ensured $BITWARDEN_SDK_REQ in existing venv"
   fi
 
   install -m 0755 "$venv/bin/keyholder"  /usr/local/bin/keyholder

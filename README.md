@@ -273,6 +273,11 @@ keyholder run github-readonly --env GITHUB_TOKEN --ttl 300 --reason "list repos"
 keyholder run google-calendar-read --env GOOGLE_WORKSPACE_CLI_TOKEN --ttl 300 --reason "read calendar" -- \
     gws calendar events list --calendarId primary
 
+# Fixed Grafana credential import (see docs/grafana-secret-import.md);
+# neither command accepts a value, host, path, key, or project from the caller
+keyholder grafana-projects
+keyholder grafana-import
+
 # Revoke an outstanding lease
 keyholder revoke lease_abc123def --reason "no longer needed"
 
@@ -329,6 +334,7 @@ pool are future optimizations.
 ## Documentation
 
 - [`docs/hermes-usage.md`](docs/hermes-usage.md) — rules for AI agent callers (narrowest grant, shortest TTL, prefer `run` over `issue`, never touch Bitwarden or upstream keys directly).
+- [`docs/grafana-secret-import.md`](docs/grafana-secret-import.md) — the fixed, create-only import of the existing Grafana admin password into Bitwarden Secrets Manager: policy fragments, deployment prerequisites, and not-yet-live-verified gates.
 - [`docs/grafana-logging.md`](docs/grafana-logging.md) — scraping the daemon's structured logs and audit trail into Grafana Loki via Alloy/Promtail.
 - [`CHANGELOG.md`](CHANGELOG.md) — notable changes per release.
 

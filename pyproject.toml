@@ -13,6 +13,7 @@ dependencies = [
   "requests>=2.31",
   "pyjwt[crypto]>=2.8",
   "boto3>=1.34",
+  "bitwarden-sdk==2.1.0",
 ]
 
 [project.optional-dependencies]

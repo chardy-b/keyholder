@@ -5,15 +5,18 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import socketserver
 import subprocess
 import grp
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
+from . import grafana_import
 from .audit import write_audit_event
 from .bitwarden import BwsResolver
 from .leases import LeaseStore
@@ -132,6 +135,11 @@ def handle_revoke(config: dict[str, Any], caller: str, request: dict[str, Any]) 
     return {"revoked": True, "lease_id": request["lease_id"]}
 
 
+def handle_grafana(config: dict[str, Any], caller: str, operation: str, raw_body: bytes | None) -> tuple[int, dict[str, Any]]:
+    _lease_db, audit = _audit_paths(config)
+    return grafana_import.handle(config, audit, caller, operation, raw_body)
+
+
 class UnixHTTPServer(socketserver.UnixStreamServer):
     allow_reuse_address = True
     def __init__(self, socket_path: str, config: dict[str, Any]):
@@ -195,7 +203,57 @@ class KeyholderHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send(getattr(exc, "status", 500), {"error": str(exc)})
 
+    def _read_grafana_body(self) -> bytes | None:
+        """Strictly framed, deadline-bounded body read; None means reject (never echoed)."""
+        lengths = self.headers.get_all("Content-Length") or []
+        if self.headers.get_all("Transfer-Encoding") or len(lengths) > 1:
+            return None
+        if lengths and not re.fullmatch(r"[0-9]{1,5}", lengths[0].strip()):
+            return None
+        length = int(lengths[0]) if lengths else 0
+        if length > grafana_import.MAX_BODY_BYTES:
+            return None
+        deadline = time.monotonic() + grafana_import.BODY_READ_SECONDS
+        body = b""
+        try:
+            while len(body) < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.connection.settimeout(remaining)
+                chunk = self.rfile.read1(length - len(body))
+                if not chunk:
+                    return None
+                body += chunk
+        except OSError:
+            return None
+        finally:
+            try:
+                self.connection.settimeout(grafana_import.BODY_READ_SECONDS)
+            except OSError:
+                pass
+        return body
+
+    def _grafana(self, operation: str) -> None:
+        # Fixed-operation routes never go through the generic JSON/error path:
+        # every failure is audited and returned as a fixed message.
+        try:
+            caller = self._caller()
+        except Exception:
+            LOG.error("peer credential lookup failed")
+            self.close_connection = True
+            self._send(500, {"error": "internal error"})
+            return
+        raw = self._read_grafana_body()
+        if raw is None:
+            self.close_connection = True  # unread or partial body: do not reuse the connection
+        status, payload = handle_grafana(self.server.config, caller, operation, raw)
+        self._send(status, payload)
+
     def do_POST(self) -> None:
+        if self.path in grafana_import.ROUTES:
+            self._grafana(grafana_import.ROUTES[self.path])
+            return
         try:
             body = self._json_body(); caller = self._caller()
             if self.path == "/v1/issue": payload = handle_issue(self.server.config, caller, body)

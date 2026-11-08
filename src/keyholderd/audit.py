@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,9 +32,12 @@ def sanitize_event(event: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
-def write_audit_event(path: str, event: dict[str, Any]) -> None:
+def write_audit_event(path: str, event: dict[str, Any], *, durable: bool = False) -> None:
     clean = sanitize_event(event)
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(clean, sort_keys=True, separators=(",", ":")) + "\n")
+        if durable:
+            fh.flush()
+            os.fsync(fh.fileno())
