@@ -52,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = sub.add_parser("grants"); g.add_argument("--profile", default="default")
     i = sub.add_parser("issue"); i.add_argument("grant"); i.add_argument("--ttl", type=int, default=None); i.add_argument("--reason", required=True); i.add_argument("--profile", default="default"); i.add_argument("--format", choices=["json", "env"], default="json")
     r = sub.add_parser("run"); r.add_argument("grant"); r.add_argument("--env", required=True, dest="env_var"); r.add_argument("--ttl", type=int, default=None); r.add_argument("--reason", required=True); r.add_argument("--profile", default="default")
+    gp = sub.add_parser("grafana-projects"); gp.add_argument("--profile", default="default")
+    gi = sub.add_parser("grafana-import"); gi.add_argument("--profile", default="default")
     rv = sub.add_parser("revoke"); rv.add_argument("lease_id"); rv.add_argument("--reason", default="manual revoke")
     sub.add_parser("doctor")
     return p
@@ -246,6 +248,15 @@ def main(argv: list[str] | None = None) -> int:
             data = request(args.socket, "POST", "/v1/run", {"grant":args.grant, "env_var":args.env_var, "ttl_seconds":args.ttl, "reason":args.reason, "profile":args.profile, "command":command})
             sys.stdout.write(data.get("stdout", "")); sys.stderr.write(data.get("stderr", ""))
             return int(data.get("exit_code", 0))
+        elif args.cmd in ("grafana-projects", "grafana-import"):
+            if extra:
+                raise RuntimeError(f"{args.cmd} takes no arguments other than --profile")
+            data = request(args.socket, "POST", "/v1/" + args.cmd, {"profile":args.profile})
+            if args.cmd == "grafana-projects":
+                for project in data.get("projects", []):
+                    print(f"{project['id']}  {project['name']}")
+            else:
+                print(json.dumps({k: data.get(k) for k in ("id", "key", "project_id", "status_verified")}, sort_keys=True))
         elif args.cmd == "revoke":
             print(json.dumps(request(args.socket, "POST", "/v1/revoke", {"lease_id":args.lease_id, "reason":args.reason})))
         elif args.cmd == "doctor":

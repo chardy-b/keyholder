@@ -38,6 +38,16 @@ def grants_for_caller(policy: dict[str, Any], uid_name: str, profile: str) -> li
     return list(prof.get("grants", []))
 
 
+def operations_for_caller(policy: dict[str, Any], uid_name: str, profile: str) -> list[Any]:
+    caller = _caller(policy, uid_name)
+    if caller is None:
+        return []
+    prof = caller.get("profiles", {}).get(profile)
+    if not isinstance(prof, dict) or not isinstance(prof.get("operations"), list):
+        return []
+    return list(prof["operations"])
+
+
 def get_grant(policy: dict[str, Any], uid_name: str, profile: str, grant_name: str) -> dict[str, Any]:
     for grant in grants_for_caller(policy, uid_name, profile):
         if grant.get("name") == grant_name:

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fixed-purpose Grafana credential import: `POST /v1/grafana-projects` and
+  `POST /v1/grafana-import` (CLI `keyholder grafana-projects` / `grafana-import`).
+  Copies one existing source password into Bitwarden Secrets Manager through the
+  official `bitwarden-sdk==2.1.0`, create-only and idempotent, authorized by a
+  new per-profile `operations` policy list that is separate from `grants`. See
+  [`docs/grafana-secret-import.md`](docs/grafana-secret-import.md).
 - A loopback-only HTTP forwarding listener for `local_proxy` grants. It
   validates short-lived capability tokens, enforces exact method and route
   allowlists, substitutes the real upstream bearer key on the wire, strips

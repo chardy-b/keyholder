@@ -43,6 +43,16 @@ The listener is off for backward compatibility unless the operator sets
 Capabilities are daemon-memory state and fail closed on restart; issue a new
 capability if the daemon restarts even if its old lease row remains in SQLite.
 
+## Grafana credential import
+
+Only when the operator has asked for it, `keyholder grafana-projects` lists the
+projects the broker's machine account can reach (id and name only) and
+`keyholder grafana-import` performs the fixed, create-only import described in
+[`grafana-secret-import.md`](grafana-secret-import.md). Neither accepts a value,
+host, path, key, or project; never try to pass one, and never read the source
+file or Bitwarden directly. Authorization is a separate `operations` policy
+entry, not a grant, so `issue` and `run` cannot reach it.
+
 ## Google Workspace CLI
 
 For Google Workspace CLI, use a purpose-named grant such as `google-calendar-read`:
