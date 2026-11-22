@@ -153,11 +153,13 @@ class BwsResolver:
         if not hmac.compare_digest(secret.value.encode("utf-8"), value.encode("utf-8")):
             raise BitwardenImportError(value_code)
 
-    def import_secret(self, *, project_id: str, key: str, value: str, note: str, organization_id: str | None = None) -> ImportedSecret:
+    def import_secret(self, *, project_id: str, key: str, value: str, note: str, organization_id: str | None = None, create_only: bool = False) -> ImportedSecret:
         """Create ``key`` in ``project_id`` unless an identical record already exists.
 
         Never updates or deletes. Create and readback run through the Bitwarden
         SDK in memory; the value is never placed in argv, env, logs, or errors.
+        With ``create_only`` any existing record for the key is ``already_exists``
+        and its value is never fetched, so the caller learns nothing about it.
         """
         client: Any = None
         try:
@@ -172,6 +174,8 @@ class BwsResolver:
         org = str(project.organization_id)
         listed = self._sdk_call("lookup_failed", client.secrets().list, org)
         matches = [item for item in listed.data if item.key == key and project.id in item.project_ids]
+        if create_only and matches:
+            raise BitwardenImportError("already_exists")
         if len(matches) > 1:
             raise BitwardenImportError("duplicate_records")
         if matches:

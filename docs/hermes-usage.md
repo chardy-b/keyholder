@@ -53,6 +53,16 @@ host, path, key, or project; never try to pass one, and never read the source
 file or Bitwarden directly. Authorization is a separate `operations` policy
 entry, not a grant, so `issue` and `run` cannot reach it.
 
+## Locally generated secrets
+
+Only with operator approval and an installed isolated writer, use
+`keyholder create-secret --grant hermes-generated --key HERMES_EXAMPLE --reason 'Provision example' -- openssl rand -hex 32`.
+The trusted local generator must not leak its output; do not use shell
+substitution, secret arguments, or secrets in the reason. Only metadata or fixed
+errors are printed. See [create-secret.md](create-secret.md) for value semantics,
+separate service policy and limits. Never provision a write token on the normal
+daemon: generic `run` commands share its OS identity.
+
 ## Google Workspace CLI
 
 For Google Workspace CLI, use a purpose-named grant such as `google-calendar-read`:

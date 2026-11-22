@@ -9,8 +9,8 @@ from keyholderd.cli import main as cli_main
 from keyholderd.server import UnixHTTPServer
 
 
-def test_e2e_fake_provider(tmp_path, capsys):
-    sock = str(tmp_path/"keyholder.sock")
+def test_e2e_fake_provider(tmp_path, capsys, short_socket):
+    sock = short_socket
     current_user = os.environ.get("USER", "hermes")
     cfg = {"version":1, "paths":{"leases_db":str(tmp_path/"leases.db"), "audit_log":str(tmp_path/"audit.jsonl")}, "callers":{"me":{"uid_name":current_user, "profiles":{"default":{"grants":[{"name":"fake", "provider":"fake", "ttl_seconds":30, "max_ttl_seconds":60, "bitwarden_refs":{}}]}}}}}
     httpd = UnixHTTPServer(sock, cfg)

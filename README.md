@@ -256,7 +256,10 @@ The daemon loads policy at startup only. Restart the service (`sudo systemctl re
 
 ## CLI
 
-All commands respect `--socket <path>` (default `/run/keyholder/keyholder.sock`).
+Commands respect explicit `--socket <path>` (default `/run/keyholder/keyholder.sock`),
+except `create-secret`, whose default is the isolated writer socket
+`/run/keyholder-secret-writer/keyholder.sock`. See [isolated secret creation](docs/create-secret.md)
+for the opt-in separate service; never load its write credential into the main daemon.
 
 ```bash
 # List the grants your Unix user is allowed to request
