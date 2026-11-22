@@ -190,8 +190,8 @@ def test_check_grants_endpoint_fails_when_unreachable(monkeypatch):
     assert result.status == "fail"
 
 
-def test_doctor_e2e_against_fake_server(tmp_path, capsys):
-    sock = str(tmp_path / "keyholder.sock")
+def test_doctor_e2e_against_fake_server(tmp_path, capsys, short_socket):
+    sock = short_socket
     current_user = os.environ.get("USER", "hermes")
     cfg = {
         "version": 1,

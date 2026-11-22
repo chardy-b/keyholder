@@ -38,14 +38,23 @@ def grants_for_caller(policy: dict[str, Any], uid_name: str, profile: str) -> li
     return list(prof.get("grants", []))
 
 
-def operations_for_caller(policy: dict[str, Any], uid_name: str, profile: str) -> list[Any]:
+def _profile_list(policy: dict[str, Any], uid_name: str, profile: str, field: str) -> list[Any]:
     caller = _caller(policy, uid_name)
     if caller is None:
         return []
     prof = caller.get("profiles", {}).get(profile)
-    if not isinstance(prof, dict) or not isinstance(prof.get("operations"), list):
+    if not isinstance(prof, dict) or not isinstance(prof.get(field), list):
         return []
-    return list(prof["operations"])
+    return list(prof[field])
+
+
+def operations_for_caller(policy: dict[str, Any], uid_name: str, profile: str) -> list[Any]:
+    return _profile_list(policy, uid_name, profile, "operations")
+
+
+def secret_creates_for_caller(policy: dict[str, Any], uid_name: str, profile: str) -> list[Any]:
+    # Separate from ``grants`` so issue/run can never reach a create-only entry.
+    return _profile_list(policy, uid_name, profile, "secret_creates")
 
 
 def get_grant(policy: dict[str, Any], uid_name: str, profile: str, grant_name: str) -> dict[str, Any]:

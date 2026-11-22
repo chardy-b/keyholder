@@ -5,8 +5,6 @@ import logging
 import os
 import re
 import select
-import signal
-import sys
 import stat
 import subprocess
 import threading
@@ -19,6 +17,7 @@ from typing import Any, Callable
 from .audit import write_audit_event
 from .bitwarden import BwsResolver
 from .policy import operations_for_caller
+from .worker import kill_group, run_forked
 
 LOG = logging.getLogger(__name__)
 
@@ -203,10 +202,10 @@ class BoundedResult:
     exceeded: bool
 
 
-def run_bounded(argv: list[str], env: dict[str, str], timeout: float, max_bytes: int) -> BoundedResult:
+def run_bounded(argv: list[str], env: dict[str, str], timeout: float, max_bytes: int, *, own_group: bool = False) -> BoundedResult:
     """Run argv, keeping at most max_bytes of stdout in memory; kill on deadline or overflow."""
     deadline = time.monotonic() + timeout
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, close_fds=True)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, close_fds=True, start_new_session=own_group)
     buf = bytearray()
     timed_out = exceeded = False
     fd = proc.stdout.fileno()  # type: ignore[union-attr]
@@ -229,12 +228,14 @@ def run_bounded(argv: list[str], env: dict[str, str], timeout: float, max_bytes:
         if timed_out or exceeded:
             _kill(proc)
         try:
-            returncode = proc.wait(timeout=max(deadline - time.monotonic(), 1.0))
+            returncode = proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
         except subprocess.TimeoutExpired:
             _kill(proc)
             proc.wait()
             returncode, timed_out = None, True
     finally:
+        if own_group:
+            kill_group(proc.pid)
         proc.stdout.close()  # type: ignore[union-attr]
         if proc.poll() is None:
             _kill(proc)
@@ -380,80 +381,14 @@ def _decode_payload(operation: str, raw: bytes, cfg: ImportConfig | None) -> dic
     return result
 
 
-def _kill_group(pid: int) -> None:
-    for kill in (lambda: os.killpg(pid, signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
-        try:
-            kill()
-        except (ProcessLookupError, PermissionError):
-            pass
-
-
-def _worker_child(read_fd: int, write_fd: int, operation: str, cfg: ImportConfig | None) -> None:
-    status = 70
-    try:
-        try:
-            os.setpgid(0, 0)  # own group (not a new session) so the parent can kill ssh with us
-            signal.alarm(int(OPERATION_TIMEOUT_SECONDS) + 5)  # self-limit even if the parent vanishes
-            null = os.open(os.devnull, os.O_RDWR)
-            for fd in (0, 1, 2):
-                os.dup2(null, fd)
-            os.closerange(3, write_fd)
-            os.closerange(write_fd + 1, 1 << 20)
-            os.environ.pop("RUST_LOG", None)
-            payload = _worker_payload(operation, cfg)
-        except BaseException:  # noqa: BLE001
-            payload = {"ok": False, "code": "internal_error"}
-        data = json.dumps(payload).encode()
-        while data:
-            data = data[os.write(write_fd, data):]
-        status = 0
-    finally:
-        os._exit(status)
-
-
 def _run_worker(operation: str, cfg: ImportConfig | None, timeout: float) -> dict[str, Any]:
     """Run the operation in a forked, killable child; only sanitized metadata comes back."""
-    read_fd, write_fd = os.pipe()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    pid = os.fork()
-    if pid == 0:
-        _worker_child(read_fd, write_fd, operation, cfg)
-    os.close(write_fd)
-    try:
-        os.setpgid(pid, pid)
-    except OSError:
-        pass  # the child already did it
-    deadline = time.monotonic() + timeout
-    buf = bytearray()
-    timed_out = overflow = False
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                break
-            if not select.select([read_fd], [], [], remaining)[0]:
-                continue
-            chunk = os.read(read_fd, 4096)
-            if not chunk:
-                break
-            buf += chunk
-            if len(buf) > MAX_WORKER_REPLY_BYTES:
-                overflow = True
-                break
-    finally:
-        os.close(read_fd)
-        _kill_group(pid)  # also sweeps any ssh left behind
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-    if timed_out:
+    outcome, raw = run_forked(lambda: _worker_payload(operation, cfg), timeout, MAX_WORKER_REPLY_BYTES)
+    if outcome == "timeout":
         raise GrafanaImportError("timeout")
-    if overflow:
+    if outcome != "ok":
         raise GrafanaImportError("worker_failed")
-    return _decode_payload(operation, bytes(buf), cfg)
+    return _decode_payload(operation, raw, cfg)
 
 
 WORKER: Callable[[str, ImportConfig | None, float], dict[str, Any]] = _run_worker

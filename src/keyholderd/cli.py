@@ -15,21 +15,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from . import secret_create
+from .grafana_import import BoundedResult, run_bounded
 from .policy import load_policy
 
 DEFAULT_SOCKET = "/run/keyholder/keyholder.sock"
+DEFAULT_CREATE_SOCKET = "/run/keyholder-secret-writer/keyholder.sock"
 DEFAULT_POLICY = "/etc/keyholder/policy.yaml"
 DEFAULT_CRED = "/etc/keyholder/bws-access-token.cred"
 CLIENT_GROUP = "keyholder-clients"
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, socket_path: str):
-        super().__init__("localhost")
+    def __init__(self, socket_path: str, *, timeout: float | None = None):
+        super().__init__("localhost", timeout=timeout)
         self.socket_path = socket_path
 
     def connect(self) -> None:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
         self.sock.connect(self.socket_path)
 
 
@@ -45,6 +49,173 @@ def request(socket_path: str, method: str, path: str, payload: dict[str, Any] | 
     return data
 
 
+# --- create-secret --------------------------------------------------------
+# Nothing on this path prints caller input, generator output, raw daemon
+# replies, or exception text: only the fixed messages below or id/key.
+
+GENERATOR_TIMEOUT_SECONDS = 10.0
+CREATE_REPLY_TIMEOUT_SECONDS = secret_create.BODY_READ_SECONDS + secret_create.OPERATION_TIMEOUT_SECONDS + 15
+MAX_CREATE_REPLY_BYTES = 8192
+CREATE_USAGE = (
+    "usage: keyholder [--socket PATH] create-secret --grant NAME --key KEY --reason TEXT\n"
+    "                 [--profile NAME] [--raw] -- GENERATOR [ARG ...]\n"
+    "Runs GENERATOR locally (no shell, stdin/stderr discarded) and stores its stdout\n"
+    "(max 4096 bytes; one trailing LF removed unless --raw) as a new secret.\n"
+)
+CREATE_MESSAGES = {
+    "usage": "invalid create-secret arguments (see keyholder create-secret --help)",
+    "generator_failed": "generator failed; nothing was sent",
+    "generator_timeout": "generator timed out; nothing was sent",
+    "generator_too_large": "generator output exceeds 4096 bytes; nothing was sent",
+    "generator_invalid": "generator output is empty, contains NUL, or is not valid UTF-8; nothing was sent",
+    "connect_failed": "could not connect to the keyholder daemon; nothing was sent",
+    "no_reply": "no valid reply from the keyholder daemon; the secret may exist, check before retrying",
+}
+_DAEMON_MESSAGES = {message: status for status, message, _state in secret_create.ERRORS.values()}
+_CREATE_OPTS = ("--grant", "--key", "--reason", "--profile")
+
+
+class CreateSecretError(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.message = CREATE_MESSAGES.get(code, code)
+
+
+def _split_create_secret(argv: list[str]) -> tuple[str, list[str]] | None:
+    """If argv is ``[--socket PATH] create-secret ...`` return (socket, rest)."""
+    socket_path, i = DEFAULT_CREATE_SOCKET, 0
+    while i < len(argv):
+        if argv[i] == "--socket" and i + 1 < len(argv):
+            socket_path, i = argv[i + 1], i + 2
+        elif argv[i].startswith("--socket="):
+            socket_path, i = argv[i][len("--socket="):], i + 1
+        else:
+            break
+    if i < len(argv) and argv[i] == "create-secret":
+        return socket_path, argv[i + 1:]
+    return None
+
+
+def parse_create_secret(rest: list[str]) -> tuple[dict[str, Any], list[str]]:
+    opts: dict[str, Any] = {"--raw": False}
+    i = 0
+    while i < len(rest) and rest[i] != "--":
+        name, eq, val = rest[i].partition("=")
+        if rest[i] == "--raw" and not opts["--raw"]:
+            opts["--raw"] = True
+            i += 1
+            continue
+        if name not in _CREATE_OPTS or name in opts:
+            raise CreateSecretError("usage")
+        if not eq:
+            if i + 1 >= len(rest):
+                raise CreateSecretError("usage")
+            val, i = rest[i + 1], i + 1
+        opts[name] = val
+        i += 1
+    command = rest[i + 1:]
+    opts.setdefault("--profile", "default")
+    if (
+        i >= len(rest) or not command
+        or not all(name in opts for name in _CREATE_OPTS)
+        or not secret_create.GRANT_RE.fullmatch(opts["--grant"])
+        or not secret_create.KEY_RE.fullmatch(opts["--key"])
+        or not secret_create.PROFILE_RE.fullmatch(opts["--profile"])
+        or not secret_create.valid_reason(opts["--reason"])
+    ):
+        raise CreateSecretError("usage")
+    return opts, command
+
+
+def _run_generator(command: list[str], env: dict[str, str], timeout: float, max_bytes: int) -> BoundedResult:
+    return run_bounded(command, env, timeout, max_bytes, own_group=True)
+
+
+def generate_value(command: list[str], *, raw: bool, runner: Callable[..., BoundedResult] = _run_generator) -> str:
+    """Run the trusted generator as the caller and return its stdout as the value."""
+    result: BoundedResult | None = None
+    try:
+        result = runner(command, dict(os.environ), GENERATOR_TIMEOUT_SECONDS, secret_create.MAX_VALUE_BYTES)
+    except Exception:  # e.g. not found: the error text would name argv
+        result = None
+    if result is None:
+        raise CreateSecretError("generator_failed")
+    if result.timed_out:
+        raise CreateSecretError("generator_timeout")
+    if result.exceeded or len(result.data) > secret_create.MAX_VALUE_BYTES:
+        raise CreateSecretError("generator_too_large")
+    if result.returncode != 0:
+        raise CreateSecretError("generator_failed")
+    data = result.data
+    if not raw and data.endswith(b"\n"):
+        data = data[:-1]
+    text: str | None = None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:  # the error object would carry the bytes
+        text = None
+    if text is None or not secret_create.valid_value(text):
+        raise CreateSecretError("generator_invalid")
+    return text
+
+
+def _post_create(socket_path: str, body: bytes) -> tuple[int, bytes]:
+    conn = UnixHTTPConnection(socket_path, timeout=CREATE_REPLY_TIMEOUT_SECONDS)
+    try:
+        try:
+            conn.connect()
+            conn.sock.settimeout(CREATE_REPLY_TIMEOUT_SECONDS)
+        except Exception:
+            conn.close()
+            raise CreateSecretError("connect_failed") from None
+        try:
+            conn.request("POST", secret_create.ROUTE, body=body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            return resp.status, resp.read(MAX_CREATE_REPLY_BYTES + 1)
+        except Exception:
+            raise CreateSecretError("no_reply") from None
+    finally:
+        conn.close()
+
+
+def validate_create_reply(status: int, raw: bytes, key: str) -> dict[str, str]:
+    data: Any = None
+    try:
+        if len(raw) <= MAX_CREATE_REPLY_BYTES:
+            data = json.loads(raw.decode("utf-8"), object_pairs_hook=secret_create._no_duplicate_keys)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise CreateSecretError("no_reply")
+    if status == 200 and set(data) == {"id", "key"} and data["key"] == key and secret_create._canonical_uuid(data["id"]):
+        return {"id": data["id"], "key": key}
+    message = data.get("error")
+    if status != 200 and set(data) == {"error"} and isinstance(message, str) and _DAEMON_MESSAGES.get(message) == status:
+        raise CreateSecretError(message)
+    raise CreateSecretError("no_reply")
+
+
+def run_create_secret(socket_path: str, rest: list[str]) -> int:
+    try:
+        if rest in (["--help"], ["-h"]):
+            sys.stdout.write(CREATE_USAGE)
+            return 0
+        opts, command = parse_create_secret(rest)
+        value = generate_value(command, raw=opts["--raw"])
+        body = json.dumps({"grant": opts["--grant"], "key": opts["--key"], "value": value, "reason": opts["--reason"], "profile": opts["--profile"]}, ensure_ascii=False).encode("utf-8")
+        del value
+        status, raw = _post_create(socket_path, body)
+        del body
+        print(json.dumps(validate_create_reply(status, raw, opts["--key"]), sort_keys=True))
+        return 0
+    except CreateSecretError as exc:
+        message = exc.message
+    except Exception:
+        message = CREATE_MESSAGES["no_reply"]
+    print(f"keyholder: {message}", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="keyholder")
     p.add_argument("--socket", default=DEFAULT_SOCKET)
@@ -54,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run"); r.add_argument("grant"); r.add_argument("--env", required=True, dest="env_var"); r.add_argument("--ttl", type=int, default=None); r.add_argument("--reason", required=True); r.add_argument("--profile", default="default")
     gp = sub.add_parser("grafana-projects"); gp.add_argument("--profile", default="default")
     gi = sub.add_parser("grafana-import"); gi.add_argument("--profile", default="default")
+    sub.add_parser("create-secret", help="store a locally generated value as a new secret (parsed separately, see create-secret --help)", add_help=False)
     rv = sub.add_parser("revoke"); rv.add_argument("lease_id"); rv.add_argument("--reason", default="manual revoke")
     sub.add_parser("doctor")
     return p
@@ -224,6 +396,13 @@ def run_doctor(socket_path: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    split = _split_create_secret(argv)
+    if split is not None:
+        return run_create_secret(*split)
+    if "create-secret" in argv[:argv.index("--") if "--" in argv else len(argv)]:
+        print(f"keyholder: {CREATE_MESSAGES['usage']}", file=sys.stderr)
+        return 2
     parser = build_parser()
     try:
         args, extra = parser.parse_known_args(argv)

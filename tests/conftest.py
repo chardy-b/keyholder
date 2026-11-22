@@ -1,4 +1,5 @@
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -7,6 +8,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import json
 
 import pytest
+
+
+@pytest.fixture
+def short_socket():
+    # Deep checkout/pytest paths may exceed Linux's 108-byte AF_UNIX limit.
+    with tempfile.TemporaryDirectory(prefix="kh") as directory:
+        yield str(Path(directory) / "s")
 
 
 @pytest.fixture(autouse=True)

@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import os
+import pwd
 import re
 import socket
 import socketserver
@@ -14,9 +15,9 @@ import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
-from typing import Any
+from typing import Any, Callable
 
-from . import grafana_import
+from . import grafana_import, secret_create
 from .audit import write_audit_event
 from .bitwarden import BwsResolver
 from .leases import LeaseStore
@@ -140,10 +141,16 @@ def handle_grafana(config: dict[str, Any], caller: str, operation: str, raw_body
     return grafana_import.handle(config, audit, caller, operation, raw_body)
 
 
+def handle_secret_create(config: dict[str, Any], caller: str, raw_body: bytes | None) -> tuple[int, dict[str, Any]]:
+    _lease_db, audit = _audit_paths(config)
+    return secret_create.handle(config, audit, caller, raw_body)
+
+
 class UnixHTTPServer(socketserver.UnixStreamServer):
     allow_reuse_address = True
-    def __init__(self, socket_path: str, config: dict[str, Any]):
+    def __init__(self, socket_path: str, config: dict[str, Any], *, secret_writer_only: bool = False):
         self.config = config
+        self.secret_writer_only = secret_writer_only
         try: os.unlink(socket_path)
         except FileNotFoundError: pass
         super().__init__(socket_path, KeyholderHandler)
@@ -181,7 +188,15 @@ def create_proxy_server(config: dict[str, Any]) -> ProxyHTTPServer:
 class KeyholderHandler(BaseHTTPRequestHandler):
     server: UnixHTTPServer
     def log_message(self, format: str, *args: Any) -> None:
-        LOG.info(format, *args)
+        if not self.server.secret_writer_only and getattr(self, "path", "") != secret_create.ROUTE:
+            LOG.info(format, *args)
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        if self.server.secret_writer_only:
+            self.close_connection = True
+            self._send(code, {"error": "invalid request"})
+        else:
+            super().send_error(code, message, explain)
 
     def _caller(self) -> str:
         _pid, uid, _gid = get_peercred(self.connection)  # type: ignore[arg-type]
@@ -196,6 +211,10 @@ class KeyholderHandler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
 
     def do_GET(self) -> None:
+        if self.server.secret_writer_only:
+            self.close_connection = True
+            self._send(404, {"error": "not found"})
+            return
         try:
             if self.path.startswith("/v1/grants"):
                 self._send(200, handle_grants(self.server.config, self._caller()))
@@ -203,17 +222,17 @@ class KeyholderHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send(getattr(exc, "status", 500), {"error": str(exc)})
 
-    def _read_grafana_body(self) -> bytes | None:
-        """Strictly framed, deadline-bounded body read; None means reject (never echoed)."""
+    def _read_strict_body(self, max_bytes: int, seconds: float) -> bytes | None:
+        """Strictly framed, total-deadline-bounded body read; None means reject (never echoed)."""
         lengths = self.headers.get_all("Content-Length") or []
         if self.headers.get_all("Transfer-Encoding") or len(lengths) > 1:
             return None
-        if lengths and not re.fullmatch(r"[0-9]{1,5}", lengths[0].strip()):
+        if lengths and not re.fullmatch(r"[0-9]{1,6}", lengths[0].strip()):
             return None
         length = int(lengths[0]) if lengths else 0
-        if length > grafana_import.MAX_BODY_BYTES:
+        if length > max_bytes:
             return None
-        deadline = time.monotonic() + grafana_import.BODY_READ_SECONDS
+        deadline = time.monotonic() + seconds
         body = b""
         try:
             while len(body) < length:
@@ -229,12 +248,12 @@ class KeyholderHandler(BaseHTTPRequestHandler):
             return None
         finally:
             try:
-                self.connection.settimeout(grafana_import.BODY_READ_SECONDS)
+                self.connection.settimeout(seconds)
             except OSError:
                 pass
         return body
 
-    def _grafana(self, operation: str) -> None:
+    def _fixed_route(self, handler: Callable[[str, bytes | None], tuple[int, dict[str, Any]]], max_bytes: int, seconds: float) -> None:
         # Fixed-operation routes never go through the generic JSON/error path:
         # every failure is audited and returned as a fixed message.
         try:
@@ -244,15 +263,27 @@ class KeyholderHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._send(500, {"error": "internal error"})
             return
-        raw = self._read_grafana_body()
+        raw = self._read_strict_body(max_bytes, seconds)
         if raw is None:
             self.close_connection = True  # unread or partial body: do not reuse the connection
-        status, payload = handle_grafana(self.server.config, caller, operation, raw)
+        status, payload = handler(caller, raw)
         self._send(status, payload)
 
     def do_POST(self) -> None:
+        if self.server.secret_writer_only:
+            if self.path == secret_create.ROUTE:
+                self._fixed_route(lambda caller, raw: handle_secret_create(self.server.config, caller, raw), secret_create.MAX_BODY_BYTES, secret_create.BODY_READ_SECONDS)
+            else:
+                self.close_connection = True
+                self._send(404, {"error": "not found"})
+            return
+        if self.path == secret_create.ROUTE:
+            self.close_connection = True
+            self._send(404, {"error": "not found"})
+            return
         if self.path in grafana_import.ROUTES:
-            self._grafana(grafana_import.ROUTES[self.path])
+            operation = grafana_import.ROUTES[self.path]
+            self._fixed_route(lambda caller, raw: handle_grafana(self.server.config, caller, operation, raw), grafana_import.MAX_BODY_BYTES, grafana_import.BODY_READ_SECONDS)
             return
         try:
             body = self._json_body(); caller = self._caller()
@@ -268,15 +299,17 @@ class KeyholderHandler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(exc)})
 
 
-def serve(config_path: str, socket_path: str, socket_group: str | None = None) -> None:
+def serve(config_path: str, socket_path: str, socket_group: str | None = None, *, secret_writer_only: bool = False) -> None:
+    if secret_writer_only and (os.getuid() == 0 or pwd.getpwuid(os.getuid()).pw_name == "keyholder"):
+        raise ServerError("secret writer requires a dedicated non-root user, not keyholder", 500)
     config = load_policy(config_path)
-    proxy_server = create_proxy_server(config) if proxy_listener_enabled(config) else None
+    proxy_server = create_proxy_server(config) if not secret_writer_only and proxy_listener_enabled(config) else None
     proxy_thread = None
     if proxy_server is not None:
         proxy_thread = threading.Thread(target=proxy_server.serve_forever, name="keyholder-proxy", daemon=True)
         proxy_thread.start()
     try:
-        with UnixHTTPServer(socket_path, config) as server:
+        with UnixHTTPServer(socket_path, config, secret_writer_only=secret_writer_only) as server:
             if socket_group:
                 gid = grp.getgrnam(socket_group).gr_gid
                 os.chown(socket_path, -1, gid)
@@ -299,13 +332,15 @@ def serve(config_path: str, socket_path: str, socket_group: str | None = None) -
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="/etc/keyholder/policy.yaml")
-    parser.add_argument("--socket", default="/run/keyholder/keyholder.sock")
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--socket", default=None)
     parser.add_argument("--socket-group", default=None)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--secret-writer-only", action="store_true", help="exclusive create-secret service; requires a separate OS identity and policy")
     args = parser.parse_args(argv)
     configure_logging(args.log_level)
-    serve(args.config, args.socket, args.socket_group)
+    service = "keyholder-secret-writer" if args.secret_writer_only else "keyholder"
+    serve(args.config or f"/etc/{service}/policy.yaml", args.socket or f"/run/{service}/keyholder.sock", args.socket_group, secret_writer_only=args.secret_writer_only)
     return 0
 
 if __name__ == "__main__":
